@@ -39,7 +39,7 @@ class ProposedOperation(StrictAIModel):
     operation: ChangeOperation
     feature_key: str | None
     content: FeatureContent | None
-    source_record_id: Annotated[int, Field(gt=0)]
+    source_record_id: Annotated[int | None, Field(gt=0)] = None
     reason: Annotated[str, Field(min_length=1, max_length=2_000)]
 
     @model_validator(mode="after")

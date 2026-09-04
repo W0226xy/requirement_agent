@@ -253,6 +253,17 @@ class RequirementAnalysisWorkflow:
                     analysis_type=AnalysisType.CONFLICT_RISK,
                 ),
             )
+            analysis = analysis.model_copy(
+                update={
+                    "proposed_operations": [
+                        operation.model_copy(
+                            update={"source_record_id": source_id}
+                        )
+                        for operation in analysis.proposed_operations
+                    ]
+                }
+            )
+
             self._validate_candidate_scope(source_id, analysis, candidates)
             self._normalize_operation_modules(
                 analysis,
