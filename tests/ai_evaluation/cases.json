@@ -1,0 +1,66 @@
+[
+  {
+    "id": "exact_duplicate",
+    "expected": "duplicate",
+    "description": "完全重复需求",
+    "source_text": "报表页面支持导出 PDF。",
+    "candidate_text": "报表页面支持导出 PDF。",
+    "expected_evidence": "能力、对象和格式完全相同"
+  },
+  {
+    "id": "semantic_duplicate",
+    "expected": "duplicate",
+    "description": "表述不同但含义相同",
+    "source_text": "用户可以把当前报表下载为 PDF 文件。",
+    "candidate_text": "报表页面支持 PDF 导出。",
+    "expected_evidence": "下载 PDF 与导出 PDF 语义相同"
+  },
+  {
+    "id": "compatible_relation",
+    "expected": "related",
+    "description": "可以共存的关联需求",
+    "source_text": "报表支持导出 PDF。",
+    "candidate_text": "报表支持按日期筛选。",
+    "expected_evidence": "同属报表模块但功能可以共存"
+  },
+  {
+    "id": "explicit_conflict",
+    "expected": "contradictory",
+    "description": "明确矛盾的需求",
+    "source_text": "导出文件必须包含用户手机号。",
+    "candidate_text": "任何导出文件都不得包含用户手机号。",
+    "expected_evidence": "对手机号是否允许导出的规则相反"
+  },
+  {
+    "id": "replacement",
+    "expected": "supersedes",
+    "description": "新需求替代旧需求",
+    "source_text": "新版仅允许导出 XLSX，停止提供 CSV。",
+    "candidate_text": "报表支持导出 CSV。",
+    "expected_evidence": "新规则明确停止旧格式"
+  },
+  {
+    "id": "prerequisite",
+    "expected": "dependency",
+    "description": "存在前置依赖",
+    "source_text": "完成报表模板配置后，用户可以按模板导出。",
+    "candidate_text": "管理员可以创建和发布报表模板。",
+    "expected_evidence": "模板导出依赖已发布模板"
+  },
+  {
+    "id": "missing_information",
+    "expected": "insufficient_info",
+    "description": "信息不足",
+    "source_text": "优化一下导出功能。",
+    "candidate_text": "报表支持导出 PDF。",
+    "expected_evidence": "未说明优化目标、范围或行为"
+  },
+  {
+    "id": "unrelated",
+    "expected": "none",
+    "description": "无关需求",
+    "source_text": "登录页面支持短信验证码。",
+    "candidate_text": "报表支持导出 PDF。",
+    "expected_evidence": "业务模块和能力均不相关"
+  }
+]
