@@ -15,6 +15,10 @@ Use the same language as the source input for all natural-language fields.
 Reuse an existing functional module when it matches the source. Do not create a narrower synonym
 such as "playback control module" when an existing "music player" module covers the requirement.
 
+functional_modules is mandatory and must contain at least one non-empty module name.
+If no existing functional module matches, infer and create one concise new functional module.
+Never return an empty functional_modules array.
+
 Keep the result concise:
 - functional_modules: at most 3 items;
 - acceptance_criteria: at most 5 items;

@@ -22,7 +22,10 @@ class RequirementEntities(StrictAIModel):
 class RequirementExtraction(StrictAIModel):
     requirement_summary: Annotated[str, Field(min_length=1, max_length=500)]
     requirement_description: Annotated[str, Field(min_length=1, max_length=20_000)]
-    functional_modules: list[str]
+    functional_modules: Annotated[
+        list[Annotated[str, Field(min_length=1, max_length=255)]],
+        Field(min_length=1, max_length=3),
+    ]
     acceptance_criteria: list[str]
     clarification_questions: list[str]
     entities: RequirementEntities
