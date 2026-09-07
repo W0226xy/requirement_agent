@@ -20,14 +20,20 @@ class RequirementEntities(StrictAIModel):
 
 
 class RequirementExtraction(StrictAIModel):
+    #简短的需求摘要
     requirement_summary: Annotated[str, Field(min_length=1, max_length=500)]
+    #完整、标准化的需求描述
     requirement_description: Annotated[str, Field(min_length=1, max_length=20_000)]
+    #需求所属功能模块
     functional_modules: Annotated[
         list[Annotated[str, Field(min_length=1, max_length=255)]],
         Field(min_length=1, max_length=3),
     ]
+    #可验证的验收条件
     acceptance_criteria: list[str]
+    #信息不明确时需要确认的问题
     clarification_questions: list[str]
+    #需求中的实体信息
     entities: RequirementEntities
 
 
