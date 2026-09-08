@@ -4,6 +4,10 @@ import httpx
 
 from requirement_agent.shared.errors import LLMServiceError
 
+# LLM / Embedding 模型适配层。它的作用是：把不同厂商但兼容 OpenAI API 格式的模型服务，统一封装成项目内部可调用的两个能力：
+# OpenAICompatibleChatModel：调用大模型生成结构化需求分析结果。
+# OpenAICompatibleEmbeddingModel：调用向量模型，把文本转换为 embedding 向量。
+
 
 class _OpenAICompatibleClient:
     def __init__(
@@ -64,6 +68,7 @@ class OpenAICompatibleChatModel(_OpenAICompatibleClient):
     def model_name(self) -> str:
         return self._model
 
+    #complete()：调用聊天模型，传入消息列表，返回模型生成的文本内容。它会检查响应的结构是否符合预期，如果不符合，会抛出 LLMServiceError 异常。
     async def complete(self, messages: list[dict[str, str]]) -> str:
         payload: dict[str, object] = {
             "model": self._model,
@@ -92,6 +97,7 @@ class OpenAICompatibleChatModel(_OpenAICompatibleClient):
             ) from None
 
 
+# Embedding 模型适配层。它的作用是：把不同厂商但兼容 OpenAI API 格式的向量模型服务，统一封装成项目内部可调用的能力：
 class OpenAICompatibleEmbeddingModel(_OpenAICompatibleClient):
     def __init__(
         self,
@@ -115,7 +121,7 @@ class OpenAICompatibleEmbeddingModel(_OpenAICompatibleClient):
     @property
     def model_name(self) -> str:
         return self._model
-
+    # embed()：调用向量模型，把文本列表转换为 embedding 向量列表。它会检查响应的结构是否符合预期，如果不符合，会抛出 LLMServiceError 异常。
     async def embed(self, texts: list[str]) -> list[list[float]]:
         payload: dict[str, object] = {
             "model": self._model,

@@ -34,17 +34,17 @@ from requirement_agent.shared.errors import (
 
 @dataclass(frozen=True)
 class IngestionResult:
-    source: SourceRecord
-    replayed: bool
+    source: SourceRecord#被摄取的源记录
+    replayed: bool#是否为重复提交
 
 
 class IngestionService:
     def __init__(
         self,
-        session: AsyncSession,
-        storage: ObjectStorage,
-        dispatcher: TaskDispatcher,
-        max_upload_size: int,
+        session: AsyncSession,#异步操作 PostgreSQL 数据库
+        storage: ObjectStorage,#操作对象存储，当前实现一般是 MinIO
+        dispatcher: TaskDispatcher,#将解析、Agent 分析等任务投递给 Celery
+        max_upload_size: int,#上传附件的最大大小限制
     ) -> None:
         self._session = session
         self._storage = storage
@@ -52,19 +52,31 @@ class IngestionService:
         self._max_upload_size = max_upload_size
 
     async def ingest(self, connector: SourceConnector, request: object) -> IngestionResult:
+        #connector代表输入渠道处理器，例如 DocumentConnector（PDF、DOCK）、ImageConnector（JPG、PNG）、WebFormConnector（纯文本网页表单） 等，
+        #request 是对应的输入对象，例如 FileConnectorRequest、WebFormConnectorRequest 等
+
+        #Connector 先统一不同来源的输入
+        #校验网页表单是否有有效文本；文件 Connector 是否收到了附件；
         if not await connector.verify(request):
             raise ConnectorVerificationError("connector rejected the input")
+
+        #Connector 将输入对象转换为统一的源输入格式
         source_input = await connector.receive(request)
         attachments = await connector.download_attachments(source_input)
-        normalized_attachments = self._validate_attachments(attachments)
-        fingerprint = self._fingerprint(source_input, normalized_attachments)
 
+        #校验附件的文件名、类型、大小等，并返回标准化后的附件列表
+        normalized_attachments = self._validate_attachments(attachments)
+
+        #幂等控制：避免重复创建需求
+        fingerprint = self._fingerprint(source_input, normalized_attachments)
         existing = await self._find_existing(source_input)
+        #如果已经存在相同的源记录，则检查其 payload 是否一致，如果一致则直接返回已存在的记录，并标记为 replayed=True
         if existing is not None:
             self._assert_same_payload(existing, fingerprint)
             self._dispatch(existing)
             return IngestionResult(source=existing, replayed=True)
 
+        #创建原始需求记录 SourceRecord
         source = self._build_source(source_input, fingerprint)
         attachment_models = [
             self._build_attachment(source_input, attachment)
@@ -73,10 +85,11 @@ class IngestionService:
         source.attachments.extend(attachment_models)
 
         try:
+            #先写数据库，再写 MinIO
             self._session.add(source)
             await self._session.flush()
             self._session.add(
-                AuditLog(
+                AuditLog(#记录审计日志，标记源记录已接收
                     actor_id=source.submitter_id,
                     action_type=AuditActionType.SOURCE_RECEIVED,
                     entity_type=AuditEntityType.SOURCE_RECORD,
@@ -90,6 +103,7 @@ class IngestionService:
             await self._session.commit()
         except IntegrityError:
             await self._session.rollback()
+            #如果数据库写入失败，可能是因为重复提交了相同的 external_event_id，这时再查找一次是否已经存在相同的源记录
             existing = await self._find_existing(source_input)
             if existing is None:
                 raise
@@ -98,17 +112,21 @@ class IngestionService:
             return IngestionResult(source=existing, replayed=True)
 
         try:
+            #将附件内容写入对象存储（MinIO），并记录审计日志
             await self._store_attachments(
                 source,
                 attachment_models,
                 normalized_attachments,
             )
+            #如果附件MinIO存储失败，则将源记录标记为解析失败，并抛出异常
         except ObjectStorageError as exc:
             await self._mark_storage_failure(source, attachment_models, str(exc))
             raise ObjectStorageError(
                 f"source {source.source_key} was saved, but its attachment could not be stored"
             ) from exc
 
+        #派发源记录到下游处理
+        #它会把 source.id 投递给 Celery Worker。之后才进入后台流程：
         self._dispatch(source)
         return IngestionResult(source=source, replayed=False)
 
@@ -194,7 +212,7 @@ class IngestionService:
         source: RawSourceInput,
         attachment: AttachmentInput,
     ) -> SourceAttachment:
-        file_hash = hashlib.sha256(attachment.content).hexdigest()
+        file_hash = hashlib.sha256(attachment.content).hexdigest()#文件内容哈希，用于标识文件真实内容。
         event_hash = hashlib.sha256(source.external_event_id.encode()).hexdigest()[:16]
         file_name = sanitize_file_name(attachment.file_name)
         return SourceAttachment(
@@ -202,7 +220,7 @@ class IngestionService:
             file_type=attachment.file_type,
             file_size=len(attachment.content),
             file_hash=file_hash,
-            storage_path=(
+            storage_path=(#是 MinIO 中对象的存储位置。
                 f"sources/{source.channel_type.value}/{event_hash}/{file_hash}/{file_name}"
             ),
             parse_status=AttachmentParseStatus.PENDING,
