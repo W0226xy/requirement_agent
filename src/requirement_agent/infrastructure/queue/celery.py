@@ -22,6 +22,7 @@ def create_celery_app(settings: Settings | None = None) -> Celery:
         task_routes={
             "requirement_agent.sources.*": {"queue": "source_processing"},
             "requirement_agent.requirements.*": {"queue": "source_processing"},
+            "requirement_agent.connectors.feishu.*": {"queue": "source_processing"},
         },
     )
     return application

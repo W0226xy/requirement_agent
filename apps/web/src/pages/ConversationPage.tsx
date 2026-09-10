@@ -1,8 +1,13 @@
 import {
   CheckOutlined,
+  DeleteOutlined,
+  EditOutlined,
   FileOutlined,
   LoadingOutlined,
+  MenuOutlined,
+  MessageOutlined,
   PaperClipOutlined,
+  PlusOutlined,
   RobotOutlined,
   SendOutlined,
   UserOutlined,
@@ -13,6 +18,8 @@ import {
   Button,
   Card,
   Divider,
+  Drawer,
+  Grid,
   Input,
   List,
   message,
@@ -21,26 +28,25 @@ import {
   Space,
   Spin,
   Tag,
+  Tooltip,
   Typography,
 } from "antd";
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate, useParams } from "react-router-dom";
 
-import { api, queryString } from "../api";
+import { api } from "../api";
 import { EmptyBlock, ErrorBlock, StatusTag, formatDate } from "../components";
 import { useSession } from "../session";
 import type {
+  Conversation,
+  ConversationMessage,
+  CreateConversationMessageResponse,
   PageResponse,
   ProposedOperation,
   Requirement,
   ReviewTask,
   SourceRecord,
 } from "../types";
-
-type IngestionResponse = {
-  source: SourceRecord;
-  replayed: boolean;
-};
 
 type Draft = {
   task: ReviewTask;
@@ -71,97 +77,289 @@ const progressText: Record<string, string> = {
   returned: "需求已退回补充",
 };
 
+function sortConversations(items: Conversation[]) {
+  return [...items].sort(
+    (left, right) =>
+      new Date(right.updated_at).getTime() - new Date(left.updated_at).getTime(),
+  );
+}
+
 export function ConversationPage() {
   const session = useSession();
   const navigate = useNavigate();
-  const [sources, setSources] = useState<SourceRecord[]>([]);
-  const [reviews, setReviews] = useState<Map<number, ReviewTask>>(new Map());
+  const { conversationKey } = useParams<{ conversationKey: string }>();
+  const screens = Grid.useBreakpoint();
+  const isMobile = !screens.md;
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [messages, setMessages] = useState<ConversationMessage[]>([]);
   const [existingModules, setExistingModules] = useState<string[]>([]);
   const [text, setText] = useState("");
   const [file, setFile] = useState<File | null>(null);
   const [sending, setSending] = useState(false);
-  const [loading, setLoading] = useState(true);
+  const [creating, setCreating] = useState(false);
+  const [deletingKey, setDeletingKey] = useState<string | null>(null);
+  const [loadingConversations, setLoadingConversations] = useState(true);
+  const [loadingMessages, setLoadingMessages] = useState(false);
   const [error, setError] = useState<unknown>(null);
   const [draft, setDraft] = useState<Draft | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
+  const [renameTitle, setRenameTitle] = useState("");
+  const [renaming, setRenaming] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const conversationStreamRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const listRequestGeneration = useRef(0);
+  const messageRequestGeneration = useRef(0);
+  const activeKeyRef = useRef(conversationKey);
+  const bootstrapRunning = useRef(false);
+  const creatingRef = useRef(false);
+  const scrollMode = useRef<"initial" | "send" | null>(null);
+  activeKeyRef.current = conversationKey;
 
-  const loadConversation = useCallback(async () => {
-    try {
-      const [sourcePage, reviewPage, requirementPage] = await Promise.all([
-        api<PageResponse<SourceRecord>>(
-          `/api/v1/source-records${queryString({
-            page: 1,
-            page_size: 100,
-            submitter_id: session.actorId,
-          })}`,
-        ),
-        api<PageResponse<ReviewTask>>("/api/v1/review-tasks?page=1&page_size=100"),
-        api<PageResponse<Requirement>>("/api/v1/requirements?page=1&page_size=100"),
-      ]);
-      setSources([...sourcePage.items].reverse());
-      setReviews(
-        new Map(reviewPage.items.map((review) => [review.source_record_id, review])),
-      );
-      setExistingModules(
-        Array.from(
-          new Set(requirementPage.items.flatMap((requirement) => requirement.functional_modules)),
-        ).sort(),
-      );
-      setError(null);
-    } catch (caught) {
-      setError(caught);
-    } finally {
-      setLoading(false);
-    }
-  }, [session.actorId]);
-
-  useEffect(() => {
-    void loadConversation();
-    const timer = window.setInterval(() => void loadConversation(), 3_000);
-    return () => window.clearInterval(timer);
-  }, [loadConversation]);
-
+  const activeConversation = useMemo(
+    () =>
+      conversations.find(
+        (conversation) => conversation.conversation_key === conversationKey,
+      ),
+    [conversationKey, conversations],
+  );
   const hasActiveTurn = useMemo(
-    () => sources.some((source) => activeStatuses.has(source.processing_status)),
-    [sources],
+    () =>
+      messages.some((item) =>
+        activeStatuses.has(item.source.processing_status),
+      ),
+    [messages],
   );
 
+  const loadConversationList = useCallback(
+    async (showLoading = false) => {
+      const generation = ++listRequestGeneration.current;
+      if (showLoading) setLoadingConversations(true);
+      try {
+        const page = await api<PageResponse<Conversation>>(
+          "/api/v1/conversations?page=1&page_size=100",
+          {},
+          session,
+        );
+        if (generation !== listRequestGeneration.current) return;
+        setConversations(sortConversations(page.items));
+        setError(null);
+      } catch (caught) {
+        if (generation === listRequestGeneration.current) setError(caught);
+      } finally {
+        if (generation === listRequestGeneration.current) {
+          setLoadingConversations(false);
+        }
+      }
+    },
+    [session],
+  );
+
+  const loadMessages = useCallback(
+    async (key: string, showLoading = false) => {
+      const generation = ++messageRequestGeneration.current;
+      if (showLoading) setLoadingMessages(true);
+      try {
+        const page = await api<PageResponse<ConversationMessage>>(
+          `/api/v1/conversations/${encodeURIComponent(key)}/messages?page=1&page_size=100`,
+          {},
+          session,
+        );
+        if (
+          generation !== messageRequestGeneration.current ||
+          activeKeyRef.current !== key
+        ) {
+          return;
+        }
+        setMessages(page.items);
+        setError(null);
+      } catch (caught) {
+        if (
+          generation === messageRequestGeneration.current &&
+          activeKeyRef.current === key
+        ) {
+          setError(caught);
+        }
+      } finally {
+        if (
+          generation === messageRequestGeneration.current &&
+          activeKeyRef.current === key
+        ) {
+          setLoadingMessages(false);
+        }
+      }
+    },
+    [session],
+  );
+
+  const createConversation = useCallback(
+    async (replace = false) => {
+      if (creatingRef.current) return null;
+      creatingRef.current = true;
+      setCreating(true);
+      try {
+        const created = await api<Conversation>(
+          "/api/v1/conversations",
+          { method: "POST", body: JSON.stringify({}) },
+          session,
+        );
+        listRequestGeneration.current += 1;
+        setConversations((current) =>
+          sortConversations([
+            created,
+            ...current.filter(
+              (item) => item.conversation_key !== created.conversation_key,
+            ),
+          ]),
+        );
+        setDrawerOpen(false);
+        setError(null);
+        navigate(`/chat/${created.conversation_key}`, { replace });
+        return created;
+      } catch (caught) {
+        setError(caught);
+        return null;
+      } finally {
+        creatingRef.current = false;
+        setCreating(false);
+        setLoadingConversations(false);
+      }
+    },
+    [navigate, session],
+  );
+
+  useEffect(() => {
+    void api<PageResponse<Requirement>>(
+      "/api/v1/requirements?page=1&page_size=100",
+      {},
+      session,
+    )
+      .then((page) => {
+        setExistingModules(
+          Array.from(
+            new Set(
+              page.items.flatMap(
+                (requirement) => requirement.functional_modules,
+              ),
+            ),
+          ).sort(),
+        );
+      })
+      .catch((caught: unknown) => setError(caught));
+  }, [session]);
+
+  useEffect(() => {
+    if (conversationKey) {
+      bootstrapRunning.current = false;
+      return;
+    }
+    if (bootstrapRunning.current) return;
+    bootstrapRunning.current = true;
+    const bootstrap = async () => {
+      setLoadingConversations(true);
+      try {
+        const page = await api<PageResponse<Conversation>>(
+          "/api/v1/conversations?page=1&page_size=100",
+          {},
+          session,
+        );
+        const sorted = sortConversations(page.items);
+        setConversations(sorted);
+        if (sorted[0]) {
+          navigate(`/chat/${sorted[0].conversation_key}`, { replace: true });
+        } else {
+          await createConversation(true);
+        }
+      } catch (caught) {
+        setError(caught);
+        setLoadingConversations(false);
+        bootstrapRunning.current = false;
+      }
+    };
+    void bootstrap();
+  }, [conversationKey, createConversation, navigate, session]);
+
+  useEffect(() => {
+    if (!conversationKey) return;
+    messageRequestGeneration.current += 1;
+    setMessages([]);
+    setLoadingMessages(true);
+    scrollMode.current = "initial";
+    void loadMessages(conversationKey, true);
+    void loadConversationList(true);
+  }, [conversationKey, loadConversationList, loadMessages]);
+
+  useEffect(() => {
+    if (!conversationKey || !hasActiveTurn) return;
+    const timer = window.setInterval(() => {
+      void loadMessages(conversationKey);
+      void loadConversationList();
+    }, 3_000);
+    return () => window.clearInterval(timer);
+  }, [
+    conversationKey,
+    hasActiveTurn,
+    loadConversationList,
+    loadMessages,
+  ]);
+
+  useEffect(() => {
+    if (loadingMessages || scrollMode.current === null) return;
+    const mode = scrollMode.current;
+    scrollMode.current = null;
+    const frame = window.requestAnimationFrame(() => {
+      const stream = conversationStreamRef.current;
+      if (stream) {
+        stream.scrollTo({
+          top: stream.scrollHeight,
+          behavior: mode === "send" ? "smooth" : "auto",
+        });
+      }
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [loadingMessages, messages]);
+
   async function sendRequirement() {
-    if (!text.trim() && !file) {
+    if (!conversationKey || (!text.trim() && !file)) {
       void message.error("请输入需求描述或选择附件");
       return;
     }
     setSending(true);
     setError(null);
     try {
-      const idempotencyKey = `web-chat-${crypto.randomUUID()}`;
-      if (file) {
-        const form = new FormData();
-        form.set("submitter_id", session.actorId);
-        form.set("submitter_name", session.actorName);
-        form.set("raw_text", text.trim());
-        form.set("file", file);
-        await api<IngestionResponse>("/api/v1/files", {
+      const form = new FormData();
+      form.set("raw_text", text.trim());
+      form.set("actor_name", session.actorName);
+      if (file) form.set("file", file);
+      const result = await api<CreateConversationMessageResponse>(
+        `/api/v1/conversations/${encodeURIComponent(conversationKey)}/messages`,
+        {
           method: "POST",
-          headers: { "Idempotency-Key": idempotencyKey },
+          headers: {
+            "Idempotency-Key": `web-chat-${crypto.randomUUID()}`,
+          },
           body: form,
-        });
-      } else {
-        await api<IngestionResponse>("/api/v1/ingestions", {
-          method: "POST",
-          headers: { "Idempotency-Key": idempotencyKey },
-          body: JSON.stringify({
-            submitter_id: session.actorId,
-            submitter_name: session.actorName,
-            raw_text: text.trim(),
-            raw_metadata: { input_surface: "conversation" },
-          }),
-        });
-      }
+        },
+        session,
+      );
+      if (activeKeyRef.current !== conversationKey) return;
+      scrollMode.current = "send";
+      setMessages((current) =>
+        [...current.filter((item) => item.message_key !== result.message.message_key), result.message].sort(
+          (left, right) => left.sequence_number - right.sequence_number,
+        ),
+      );
       setText("");
       setFile(null);
-      void message.success("需求已保存，AI 正在分析");
-      await loadConversation();
+      if (fileInputRef.current) fileInputRef.current.value = "";
+      void message.success(
+        result.replayed ? "该消息已提交，正在同步分析状态" : "需求已保存，AI 正在分析",
+      );
+      await Promise.all([
+        loadMessages(conversationKey),
+        loadConversationList(),
+      ]);
     } catch (caught) {
       setError(caught);
     } finally {
@@ -175,9 +373,13 @@ export function ConversationPage() {
     setDraft({
       source,
       task,
-      title: String(extraction.requirement_summary ?? source.raw_text.slice(0, 80)),
+      title: String(
+        extraction.requirement_summary ?? source.raw_text.slice(0, 80),
+      ),
       module: modules[0] ?? "未分类",
-      description: String(extraction.requirement_description ?? source.raw_text),
+      description: String(
+        extraction.requirement_description ?? source.raw_text,
+      ),
       criteria: stringArray(extraction.acceptance_criteria).join("\n"),
     });
   }
@@ -220,7 +422,12 @@ export function ConversationPage() {
       );
       setDraft(null);
       void message.success("需求已保留并生成正式版本");
-      await loadConversation();
+      if (conversationKey) {
+        await Promise.all([
+          loadMessages(conversationKey),
+          loadConversationList(),
+        ]);
+      }
     } catch (caught) {
       setError(caught);
     } finally {
@@ -234,101 +441,299 @@ export function ConversationPage() {
         `/api/v1/review-tasks/${task.id}/reject`,
         {
           method: "POST",
-          body: JSON.stringify({ comment: "用户在需求对话中选择不保留" }),
+          body: JSON.stringify({
+            comment: "用户在需求对话中选择不保留",
+          }),
         },
         session,
       );
       void message.success("该需求已标记为不保留");
-      await loadConversation();
+      if (conversationKey) {
+        await Promise.all([
+          loadMessages(conversationKey),
+          loadConversationList(),
+        ]);
+      }
     } catch (caught) {
       setError(caught);
     }
   }
 
-  async function retry(source: SourceRecord) {
+  async function retry(item: ConversationMessage) {
+    if (!conversationKey) return;
     try {
-      await api(`/api/v1/source-records/${source.id}/reanalyze`, { method: "POST" });
+      await api(
+        `/api/v1/conversations/${encodeURIComponent(conversationKey)}/messages/${encodeURIComponent(item.message_key)}/reanalyze`,
+        { method: "POST" },
+        session,
+      );
+      setMessages((current) =>
+        current.map((messageItem) =>
+          messageItem.message_key === item.message_key
+            ? {
+                ...messageItem,
+                source: {
+                  ...messageItem.source,
+                  processing_status: "parsing",
+                },
+              }
+            : messageItem,
+        ),
+      );
       void message.success("已重新提交分析");
-      await loadConversation();
+      await loadMessages(conversationKey);
     } catch (caught) {
       setError(caught);
     }
   }
+
+  function openRename(conversation: Conversation) {
+    setRenameTarget(conversation);
+    setRenameTitle(conversation.title);
+  }
+
+  async function renameConversation() {
+    if (!renameTarget || !renameTitle.trim()) {
+      void message.error("会话标题不能为空");
+      return;
+    }
+    setRenaming(true);
+    try {
+      const updated = await api<Conversation>(
+        `/api/v1/conversations/${encodeURIComponent(renameTarget.conversation_key)}`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({ title: renameTitle.trim() }),
+        },
+        session,
+      );
+      listRequestGeneration.current += 1;
+      setConversations((current) =>
+        sortConversations(
+          current.map((item) =>
+            item.conversation_key === updated.conversation_key ? updated : item,
+          ),
+        ),
+      );
+      setRenameTarget(null);
+      void message.success("会话已重命名");
+    } catch (caught) {
+      setError(caught);
+    } finally {
+      setRenaming(false);
+    }
+  }
+
+  async function deleteConversation(target: Conversation) {
+    setDeletingKey(target.conversation_key);
+    try {
+      await api<void>(
+        `/api/v1/conversations/${encodeURIComponent(target.conversation_key)}`,
+        { method: "DELETE" },
+        session,
+      );
+      listRequestGeneration.current += 1;
+      const index = conversations.findIndex(
+        (item) => item.conversation_key === target.conversation_key,
+      );
+      const remaining = conversations.filter(
+        (item) => item.conversation_key !== target.conversation_key,
+      );
+      setConversations(remaining);
+      void message.success("会话已删除");
+      if (target.conversation_key === conversationKey) {
+        messageRequestGeneration.current += 1;
+        const next = remaining[Math.min(Math.max(index, 0), remaining.length - 1)];
+        if (next) {
+          navigate(`/chat/${next.conversation_key}`, { replace: true });
+        } else {
+          await createConversation(true);
+        }
+      }
+    } catch (caught) {
+      setError(caught);
+    } finally {
+      setDeletingKey(null);
+    }
+  }
+
+  const sidebar = (
+    <ConversationSidebar
+      conversations={conversations}
+      activeKey={conversationKey}
+      loading={loadingConversations}
+      creating={creating}
+      deletingKey={deletingKey}
+      onCreate={() => void createConversation()}
+      onSelect={(key) => {
+        setDrawerOpen(false);
+        if (key !== conversationKey) navigate(`/chat/${key}`);
+      }}
+      onRename={openRename}
+      onDelete={(conversation) => void deleteConversation(conversation)}
+    />
+  );
 
   return (
     <div className="conversation-page">
-      <div className="conversation-heading">
-        <div>
-          <Typography.Title level={2}>提出需求</Typography.Title>
-          <Typography.Text type="secondary">
-            描述你的想法，AI 会检索历史需求并分析冲突和风险，最终由你决定是否保留。
-          </Typography.Text>
-        </div>
-        {hasActiveTurn && <Tag icon={<LoadingOutlined />} color="processing">AI 分析中</Tag>}
-      </div>
+      {!isMobile && <aside className="conversation-sidebar">{sidebar}</aside>}
+      {isMobile && (
+        <Drawer
+          open={drawerOpen}
+          title="需求会话"
+          placement="left"
+          width="min(88vw, 340px)"
+          className="conversation-drawer"
+          onClose={() => setDrawerOpen(false)}
+        >
+          {sidebar}
+        </Drawer>
+      )}
 
-      {error !== null && <ErrorBlock error={error} />}
-      <div className="conversation-stream">
-        {loading ? (
-          <div className="state-block"><Spin size="large" /></div>
-        ) : sources.length === 0 ? (
-          <EmptyBlock description="还没有需求，先在下方描述一个想法吧" />
-        ) : (
-          sources.map((source) => (
-            <ConversationTurn
-              key={source.id}
-              source={source}
-              review={reviews.get(source.id)}
-              onRetain={openDraft}
-              onReject={(task) => void reject(task)}
-              onRetry={() => void retry(source)}
-              onAdvanced={(task) => navigate(`/reviews/${task.id}`)}
-              onOpenRequirement={(task) => {
-                if (task.target_requirement_id) {
-                  navigate(`/requirements/${task.target_requirement_id}`);
-                }
-              }}
-            />
-          ))
-        )}
-      </div>
-
-      <Card className="conversation-composer">
-        <Input.TextArea
-          value={text}
-          autoSize={{ minRows: 3, maxRows: 8 }}
-          placeholder="例如：报表页需要支持导出 PDF，文件中要包含当前筛选条件……"
-          onChange={(event) => setText(event.target.value)}
-          onPressEnter={(event) => {
-            if (!event.shiftKey) {
-              event.preventDefault();
-              void sendRequirement();
-            }
-          }}
-        />
-        <div className="composer-actions">
-          <label className="file-picker">
-            <PaperClipOutlined />
-            <span>{file ? file.name : "添加 PDF、Word 或截图"}</span>
-            <input
-              type="file"
-              accept=".pdf,.docx,.png,.jpg,.jpeg"
-              onChange={(event) => setFile(event.target.files?.[0] ?? null)}
-            />
-          </label>
-          <Space>
-            {file && <Button type="text" onClick={() => setFile(null)}>移除附件</Button>}
-            <Button
-              type="primary"
-              icon={<SendOutlined />}
-              loading={sending}
-              onClick={() => void sendRequirement()}
-            >
-              提交需求
-            </Button>
+      <section className="conversation-main">
+        <div className="conversation-heading">
+          <Space align="start">
+            {isMobile && (
+              <Tooltip title="打开会话列表">
+                <Button
+                  type="text"
+                  icon={<MenuOutlined />}
+                  aria-label="打开会话列表"
+                  onClick={() => setDrawerOpen(true)}
+                />
+              </Tooltip>
+            )}
+            <div>
+              <Typography.Title level={3}>
+                {activeConversation?.title ?? "需求对话"}
+              </Typography.Title>
+              {activeConversation?.summary ? (
+                <Typography.Text type="secondary" ellipsis>
+                  {activeConversation.summary}
+                </Typography.Text>
+              ) : (
+                <Typography.Text type="secondary">
+                  描述你的想法，AI 会结合本会话记忆分析需求。
+                </Typography.Text>
+              )}
+              {!!activeConversation?.memory_revision && (
+                <Typography.Text className="conversation-memory-meta" type="secondary">
+                  记忆版本 {activeConversation.memory_revision} · 已覆盖至消息{" "}
+                  {activeConversation.memory_covered_sequence}
+                </Typography.Text>
+              )}
+            </div>
           </Space>
+          {hasActiveTurn && (
+            <Tag icon={<LoadingOutlined />} color="processing">
+              AI 分析中
+            </Tag>
+          )}
         </div>
-      </Card>
+
+        {error !== null && (
+          <div className="conversation-error">
+            <ErrorBlock error={error} />
+          </div>
+        )}
+        <div className="conversation-stream" ref={conversationStreamRef}>
+          {loadingMessages ? (
+            <div className="state-block">
+              <Spin size="large" />
+            </div>
+          ) : messages.length === 0 ? (
+            <EmptyBlock description="这个会话还没有需求，先在下方描述一个想法吧" />
+          ) : (
+            messages.map((item) => (
+              <ConversationTurn
+                key={item.message_key}
+                source={item.source}
+                review={item.review_task ?? undefined}
+                onRetain={openDraft}
+                onReject={(task) => void reject(task)}
+                onRetry={() => void retry(item)}
+                onAdvanced={(task) => navigate(`/reviews/${task.id}`)}
+                onOpenRequirement={(task) => {
+                  if (task.target_requirement_id) {
+                    navigate(`/requirements/${task.target_requirement_id}`);
+                  }
+                }}
+              />
+            ))
+          )}
+        </div>
+
+        <Card className="conversation-composer">
+          <Input.TextArea
+            value={text}
+            autoSize={{ minRows: 2, maxRows: 6 }}
+            placeholder="例如：报表页需要支持导出 PDF，文件中要包含当前筛选条件……"
+            aria-label="需求描述"
+            onChange={(event) => setText(event.target.value)}
+            onPressEnter={(event) => {
+              if (!event.shiftKey) {
+                event.preventDefault();
+                void sendRequirement();
+              }
+            }}
+          />
+          <div className="composer-actions">
+            <label className="file-picker">
+              <PaperClipOutlined />
+              <span>{file ? file.name : "添加 PDF、Word 或截图"}</span>
+              <input
+                ref={fileInputRef}
+                type="file"
+                aria-label="添加附件"
+                accept=".pdf,.docx,.png,.jpg,.jpeg"
+                onChange={(event) => setFile(event.target.files?.[0] ?? null)}
+              />
+            </label>
+            <Space>
+              {file && (
+                <Button
+                  type="text"
+                  onClick={() => {
+                    setFile(null);
+                    if (fileInputRef.current) fileInputRef.current.value = "";
+                  }}
+                >
+                  移除附件
+                </Button>
+              )}
+              <Button
+                type="primary"
+                icon={<SendOutlined />}
+                loading={sending}
+                disabled={!conversationKey}
+                onClick={() => void sendRequirement()}
+              >
+                提交需求
+              </Button>
+            </Space>
+          </div>
+        </Card>
+      </section>
+
+      <Modal
+        open={renameTarget !== null}
+        title="重命名会话"
+        okText="保存"
+        cancelText="取消"
+        confirmLoading={renaming}
+        onOk={() => void renameConversation()}
+        onCancel={() => setRenameTarget(null)}
+      >
+        <Input
+          value={renameTitle}
+          maxLength={255}
+          showCount
+          autoFocus
+          aria-label="会话标题"
+          onChange={(event) => setRenameTitle(event.target.value)}
+          onPressEnter={() => void renameConversation()}
+        />
+      </Modal>
 
       <Modal
         open={draft !== null}
@@ -351,7 +756,9 @@ export function ConversationPage() {
               <Typography.Text strong>需求标题</Typography.Text>
               <Input
                 value={draft.title}
-                onChange={(event) => setDraft({ ...draft, title: event.target.value })}
+                onChange={(event) =>
+                  setDraft({ ...draft, title: event.target.value })
+                }
               />
             </label>
             <label>
@@ -364,7 +771,9 @@ export function ConversationPage() {
                 }))}
                 placeholder="优先选择已有模块，也可输入新模块"
                 filterOption={(input, option) =>
-                  String(option?.value ?? "").toLowerCase().includes(input.toLowerCase())
+                  String(option?.value ?? "")
+                    .toLowerCase()
+                    .includes(input.toLowerCase())
                 }
                 onChange={(value) => setDraft({ ...draft, module: value })}
               />
@@ -384,12 +793,125 @@ export function ConversationPage() {
               <Input.TextArea
                 value={draft.criteria}
                 autoSize={{ minRows: 3, maxRows: 8 }}
-                onChange={(event) => setDraft({ ...draft, criteria: event.target.value })}
+                onChange={(event) =>
+                  setDraft({ ...draft, criteria: event.target.value })
+                }
               />
             </label>
           </Space>
         )}
       </Modal>
+    </div>
+  );
+}
+
+function ConversationSidebar({
+  conversations,
+  activeKey,
+  loading,
+  creating,
+  deletingKey,
+  onCreate,
+  onSelect,
+  onRename,
+  onDelete,
+}: {
+  conversations: Conversation[];
+  activeKey?: string;
+  loading: boolean;
+  creating: boolean;
+  deletingKey: string | null;
+  onCreate: () => void;
+  onSelect: (key: string) => void;
+  onRename: (conversation: Conversation) => void;
+  onDelete: (conversation: Conversation) => void;
+}) {
+  return (
+    <div className="conversation-sidebar-inner">
+      <div className="conversation-sidebar-header">
+        <Typography.Title level={5}>需求会话</Typography.Title>
+        <Tooltip title="新建会话">
+          <Button
+            type="primary"
+            icon={<PlusOutlined />}
+            loading={creating}
+            aria-label="新建会话"
+            onClick={onCreate}
+          />
+        </Tooltip>
+      </div>
+      <div className="conversation-list">
+        {loading && conversations.length === 0 ? (
+          <div className="conversation-list-loading">
+            <Spin />
+          </div>
+        ) : conversations.length === 0 ? (
+          <EmptyBlock description="暂无会话" />
+        ) : (
+          conversations.map((conversation) => {
+            const selected = conversation.conversation_key === activeKey;
+            return (
+              <div
+                key={conversation.conversation_key}
+                className={`conversation-list-item${selected ? " selected" : ""}`}
+              >
+                <button
+                  type="button"
+                  className="conversation-list-select"
+                  aria-current={selected ? "page" : undefined}
+                  onClick={() => onSelect(conversation.conversation_key)}
+                >
+                  <MessageOutlined />
+                  <span className="conversation-list-copy">
+                    <span className="conversation-list-title">
+                      {conversation.title}
+                    </span>
+                    <span className="conversation-list-detail">
+                      {conversation.summary ||
+                        `更新于 ${formatDate(conversation.updated_at)}`}
+                    </span>
+                    {!!conversation.memory_revision && (
+                      <span className="conversation-list-memory">
+                        记忆 v{conversation.memory_revision}
+                      </span>
+                    )}
+                  </span>
+                </button>
+                <div className="conversation-list-actions">
+                  <Tooltip title="重命名">
+                    <Button
+                      type="text"
+                      size="small"
+                      icon={<EditOutlined />}
+                      aria-label={`重命名会话：${conversation.title}`}
+                      onClick={() => onRename(conversation)}
+                    />
+                  </Tooltip>
+                  <Popconfirm
+                    title="删除这个会话？"
+                    description="会话及其记忆将从列表中移除，此操作不可撤销。"
+                    okText="删除"
+                    cancelText="取消"
+                    okButtonProps={{ danger: true }}
+                    onConfirm={() => onDelete(conversation)}
+                  >
+                    <Tooltip title="删除">
+                      <Button
+                        type="text"
+                        danger
+                        size="small"
+                        icon={<DeleteOutlined />}
+                        loading={deletingKey === conversation.conversation_key}
+                        aria-label={`删除会话：${conversation.title}`}
+                      />
+                    </Tooltip>
+                  </Popconfirm>
+                </div>
+              </div>
+            );
+          })
+        )}
+      </div>
     </div>
   );
 }
@@ -415,17 +937,27 @@ function ConversationTurn({
   return (
     <div className="conversation-turn">
       <div className="chat-row chat-row-user">
-        <div className="chat-avatar"><UserOutlined /></div>
+        <div className="chat-avatar">
+          <UserOutlined />
+        </div>
         <div className="chat-bubble user-bubble">
-          <Typography.Paragraph>{source.raw_text || "请分析附件中的需求"}</Typography.Paragraph>
+          <Typography.Paragraph>
+            {source.raw_text || "请分析附件中的需求"}
+          </Typography.Paragraph>
           {source.attachments.map((attachment) => (
-            <Tag icon={<FileOutlined />} key={attachment.id}>{attachment.file_name}</Tag>
+            <Tag icon={<FileOutlined />} key={attachment.id}>
+              {attachment.file_name}
+            </Tag>
           ))}
-          <div className="chat-meta">{source.source_key} · {formatDate(source.received_at)}</div>
+          <div className="chat-meta">
+            {source.source_key} · {formatDate(source.received_at)}
+          </div>
         </div>
       </div>
       <div className="chat-row chat-row-assistant">
-        <div className="chat-avatar assistant-avatar"><RobotOutlined /></div>
+        <div className="chat-avatar assistant-avatar">
+          <RobotOutlined />
+        </div>
         <div className="chat-bubble assistant-bubble">
           {failed ? (
             <>
@@ -435,12 +967,17 @@ function ConversationTurn({
                 message="分析未完成"
                 description={`当前状态：${source.processing_status}。原始输入已经安全保存。`}
               />
-              <Button className="chat-action" onClick={onRetry}>重新分析</Button>
+              <Button className="chat-action" onClick={onRetry}>
+                重新分析
+              </Button>
             </>
           ) : !review ? (
             <Space>
               <Spin size="small" />
-              <span>{progressText[source.processing_status] ?? source.processing_status}</span>
+              <span>
+                {progressText[source.processing_status] ??
+                  source.processing_status}
+              </span>
             </Space>
           ) : (
             <AnalysisReply
@@ -558,7 +1095,9 @@ function AnalysisReply({
           >
             <Button danger>不保留</Button>
           </Popconfirm>
-          <Button onClick={() => onAdvanced(review)}>合并已有需求 / 高级审核</Button>
+          <Button onClick={() => onAdvanced(review)}>
+            合并已有需求 / 高级审核
+          </Button>
         </Space>
       ) : review.review_status === "approved" ? (
         <Button type="link" onClick={() => onOpenRequirement(review)}>
@@ -566,7 +1105,9 @@ function AnalysisReply({
         </Button>
       ) : (
         <Typography.Text type="secondary">
-          {review.review_status === "rejected" ? "你已选择不保留该需求。" : "该需求已退回处理。"}
+          {review.review_status === "rejected"
+            ? "你已选择不保留该需求。"
+            : "该需求已退回处理。"}
         </Typography.Text>
       )}
     </>

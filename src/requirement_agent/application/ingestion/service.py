@@ -51,7 +51,13 @@ class IngestionService:
         self._dispatcher = dispatcher
         self._max_upload_size = max_upload_size
 
-    async def ingest(self, connector: SourceConnector, request: object) -> IngestionResult:
+    async def ingest(
+        self,
+        connector: SourceConnector,
+        request: object,
+        *,
+        dispatch: bool = True,
+    ) -> IngestionResult:
         #connector代表输入渠道处理器，例如 DocumentConnector（PDF、DOCK）、ImageConnector（JPG、PNG）、WebFormConnector（纯文本网页表单） 等，
         #request 是对应的输入对象，例如 FileConnectorRequest、WebFormConnectorRequest 等
 
@@ -73,7 +79,8 @@ class IngestionService:
         #如果已经存在相同的源记录，则检查其 payload 是否一致，如果一致则直接返回已存在的记录，并标记为 replayed=True
         if existing is not None:
             self._assert_same_payload(existing, fingerprint)
-            self._dispatch(existing)
+            if dispatch:
+                self._dispatch(existing)
             return IngestionResult(source=existing, replayed=True)
 
         #创建原始需求记录 SourceRecord
@@ -108,7 +115,8 @@ class IngestionService:
             if existing is None:
                 raise
             self._assert_same_payload(existing, fingerprint)
-            self._dispatch(existing)
+            if dispatch:
+                self._dispatch(existing)
             return IngestionResult(source=existing, replayed=True)
 
         try:
@@ -127,8 +135,12 @@ class IngestionService:
 
         #派发源记录到下游处理
         #它会把 source.id 投递给 Celery Worker。之后才进入后台流程：
-        self._dispatch(source)
+        if dispatch:
+            self._dispatch(source)
         return IngestionResult(source=source, replayed=False)
+
+    def dispatch(self, source: SourceRecord) -> None:
+        self._dispatch(source)
 
     def _validate_attachments(
         self,

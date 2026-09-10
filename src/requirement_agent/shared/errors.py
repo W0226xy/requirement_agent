@@ -6,12 +6,32 @@ class ConnectorVerificationError(ApplicationError):
     code = "CONNECTOR_VERIFICATION_FAILED"
 
 
+class FeishuCallbackAuthenticationError(ApplicationError):
+    code = "FEISHU_CALLBACK_AUTHENTICATION_FAILED"
+
+
+class FeishuCallbackPayloadError(ApplicationError):
+    code = "FEISHU_CALLBACK_PAYLOAD_INVALID"
+
+
+class FeishuEncryptedCallbackError(ApplicationError):
+    code = "FEISHU_ENCRYPTED_CALLBACK_UNSUPPORTED"
+
+
+class FeishuAPIError(ApplicationError):
+    code = "FEISHU_API_ERROR"
+
+
 class IdempotencyConflictError(ApplicationError):
     code = "IDEMPOTENCY_CONFLICT"
 
 
 class SourceNotFoundError(ApplicationError):
     code = "SOURCE_NOT_FOUND"
+
+
+class ConversationNotFoundError(ApplicationError):
+    code = "CONVERSATION_NOT_FOUND"
 
 
 class UnsupportedFileError(ApplicationError):

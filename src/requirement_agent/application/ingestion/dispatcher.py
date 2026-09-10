@@ -8,6 +8,7 @@ from requirement_agent.infrastructure.queue.celery import create_celery_app
 PARSE_SOURCE_TASK = "requirement_agent.sources.parse"
 ANALYZE_SOURCE_TASK = "requirement_agent.sources.analyze"
 INDEX_VERSION_TASK = "requirement_agent.requirements.index_version"
+FEISHU_EVENT_TASK = "requirement_agent.connectors.feishu.process_event"
 
 
 class TaskDispatcher(Protocol):
@@ -18,6 +19,11 @@ class TaskDispatcher(Protocol):
         ...
 
     def dispatch_version(self, version_id: int) -> None:
+        ...
+
+
+class FeishuEventDispatcher(Protocol):
+    def dispatch_feishu_event(self, payload: dict[str, object]) -> None:
         ...
 
 
@@ -33,6 +39,9 @@ class CeleryTaskDispatcher:
 
     def dispatch_version(self, version_id: int) -> None:
         self._celery_app.send_task(INDEX_VERSION_TASK, args=[version_id])
+
+    def dispatch_feishu_event(self, payload: dict[str, object]) -> None:
+        self._celery_app.send_task(FEISHU_EVENT_TASK, args=[payload])
 
 
 @lru_cache

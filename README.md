@@ -1,7 +1,7 @@
 # 多渠道输入需求管理 Agent
 
 这是一个采用 FastAPI、Celery、PostgreSQL/pgvector、Redis、MinIO 和 React
-构建的模块化单体应用。当前完成阶段 5 管理后台。
+构建的模块化单体应用。当前完成阶段 6 飞书集成。
 
 ## 环境要求
 
@@ -115,6 +115,25 @@ curl 'http://localhost:8000/api/v1/source-records/1'
 curl 'http://localhost:8000/api/v1/source-records?channel_type=document'
 ```
 
+### 飞书事件订阅
+
+在 `.env` 配置 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`、
+`FEISHU_VERIFICATION_TOKEN` 和 `FEISHU_ENCRYPT_KEY`，并将飞书事件订阅地址设置为：
+
+```text
+POST https://<公开域名>/api/v1/connectors/feishu/events
+```
+
+接口同步完成 URL verification、verification token 和 v2 callback signature 校验，然后立即
+返回并把 `im.message.receive_v1` 事件交给 Celery。文本消息的 JSON `content` 会转换为原始
+需求；图片和文件使用租户访问令牌从飞书开放平台下载，经统一附件大小、扩展名、MIME 和
+文件签名校验后写入 MinIO。`event_id` 是渠道幂等键。
+
+租户令牌会在内存中缓存并在过期前刷新。开放平台请求默认超时 10 秒，可通过
+`FEISHU_TIMEOUT_SECONDS` 调整；私有化部署可通过 `FEISHU_BASE_URL` 更改开放平台地址。
+凭据、verification token、encrypt key 和租户访问令牌不会写入来源元数据或错误消息。
+当前版本会安全拒绝 `encrypt` 加密回调；请在飞书后台启用 v2 签名，但不要启用消息体加密。
+
 ### 异步解析状态
 
 输入持久化后才会投递 Celery 任务：
@@ -162,7 +181,7 @@ LLM_MODEL=replace-with-your-chat-model
 EMBEDDING_BASE_URL=https://embedding-provider.example/v1
 EMBEDDING_API_KEY=replace-with-your-embedding-api-key
 EMBEDDING_MODEL=replace-with-your-embedding-model
-EMBEDDING_DIMENSION=1536
+EMBEDDING_DIMENSION=1024
 LLM_TIMEOUT_SECONDS=60
 LLM_MAX_RETRIES=2
 ```
@@ -334,7 +353,7 @@ curl 'http://localhost:8000/api/v1/requirements/1/diff?to_version=2'
 - `/sources`、`/sources/{id}`：原始输入、附件解析结果和 AI 调用链。
 - `/search`：普通字段、全文与向量混合检索。
 - `/analysis`：AI 调用记录、失败任务和重试入口。
-- `/connectors`：内置渠道状态和阶段 6 飞书接入说明。
+- `/connectors`：内置渠道状态和已启用的飞书接入说明。
 
 Vite 将 `/api` 和 `/health` 代理到 `VITE_API_PROXY_TARGET`。Docker Compose 默认指向
 `http://api:8000`，因此浏览器不需要单独配置 CORS。

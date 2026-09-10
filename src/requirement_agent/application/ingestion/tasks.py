@@ -12,10 +12,18 @@ from requirement_agent.ai.llm.factory import get_embedding_model, get_llm
 from requirement_agent.ai.retrieval.hybrid import RetrievalWeights
 from requirement_agent.application.ingestion.dispatcher import (
     ANALYZE_SOURCE_TASK,
+    FEISHU_EVENT_TASK,
     INDEX_VERSION_TASK,
     PARSE_SOURCE_TASK,
+    get_task_dispatcher,
 )
+from requirement_agent.application.ingestion.service import IngestionService
 from requirement_agent.application.versions.indexing import index_requirement_version
+from requirement_agent.connectors.feishu import (
+    FeishuConnector,
+    FeishuEventRequest,
+    FeishuOpenAPIClient,
+)
 from requirement_agent.infrastructure.database.models import (
     AuditLog,
     SourceAttachment,
@@ -35,6 +43,7 @@ from requirement_agent.shared.enums import (
 from requirement_agent.shared.errors import (
     ApplicationError,
     AttachmentProcessingError,
+    FeishuAPIError,
     LLMServiceError,
     SourceNotFoundError,
 )
@@ -163,6 +172,9 @@ def register_tasks(celery_app: Celery) -> None:
     def index_version_task(version_id: int) -> None:
         run_worker_coroutine(index_version(version_id))
 
+    def process_feishu_event_task(payload: dict[str, object]) -> None:
+        run_worker_coroutine(process_feishu_event(payload))
+
     celery_app.task(
         name=PARSE_SOURCE_TASK,
         autoretry_for=(AttachmentProcessingError,),
@@ -178,6 +190,13 @@ def register_tasks(celery_app: Celery) -> None:
         retry_jitter=True,
         retry_kwargs={"max_retries": 3},
     )(index_version_task)
+    celery_app.task(
+        name=FEISHU_EVENT_TASK,
+        autoretry_for=(FeishuAPIError,),
+        retry_backoff=True,
+        retry_jitter=True,
+        retry_kwargs={"max_retries": 3},
+    )(process_feishu_event_task)
 
 
 async def analyze_source(source_record_id: int) -> None:
@@ -201,3 +220,23 @@ async def analyze_source(source_record_id: int) -> None:
 async def index_version(version_id: int) -> None:
     async with get_session_factory()() as session:
         await index_requirement_version(session, get_embedding_model(), version_id)
+
+
+async def process_feishu_event(payload: dict[str, object]) -> None:
+    settings = get_settings()
+    request = FeishuEventRequest.model_validate(payload)
+    async with FeishuOpenAPIClient(
+        app_id=settings.feishu_app_id,
+        app_secret=settings.feishu_app_secret.get_secret_value(),
+        base_url=settings.feishu_base_url,
+        timeout_seconds=settings.feishu_timeout_seconds,
+        max_download_size=settings.max_upload_size_bytes,
+    ) as client:
+        async with get_session_factory()() as session:
+            service = IngestionService(
+                session=session,
+                storage=get_object_storage(),
+                dispatcher=get_task_dispatcher(),
+                max_upload_size=settings.max_upload_size_bytes,
+            )
+            await service.ingest(FeishuConnector(client), request)

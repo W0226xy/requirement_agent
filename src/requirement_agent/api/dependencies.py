@@ -24,6 +24,12 @@ def get_reviewer(
     return actor_id
 
 
+def get_actor_id(
+    actor_id: Annotated[str, Header(alias="X-Actor-ID", min_length=1, max_length=255)],
+) -> str:
+    return actor_id
+
+
 def get_ingestion_service(
     session: Annotated[AsyncSession, Depends(get_session)],
     storage: Annotated[ObjectStorage, Depends(get_object_storage)],

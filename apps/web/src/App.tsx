@@ -133,10 +133,13 @@ function ManagementApp() {
               </Button>
             </Space>
           </Layout.Header>
-          <Layout.Content className="app-content">
+          <Layout.Content
+            className={`app-content${location.pathname.startsWith("/chat") ? " app-content-chat" : ""}`}
+          >
             <Suspense fallback={<LoadingBlock />}>
               <Routes>
                 <Route path="/chat" element={<ConversationPage />} />
+                <Route path="/chat/:conversationKey" element={<ConversationPage />} />
                 <Route path="/requirements" element={<RequirementsPage />} />
                 <Route path="/requirements/:id" element={<RequirementDetailPage />} />
                 <Route path="/reviews" element={<ReviewsPage />} />

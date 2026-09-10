@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from collections.abc import Mapping, Sequence
 from functools import lru_cache
 from io import BytesIO
@@ -10,6 +11,7 @@ from requirement_agent.parsers.base import OcrEngine, ParsedAttachment
 from requirement_agent.shared.errors import AttachmentProcessingError
 
 IMAGE_TYPES = {"image/jpeg", "image/png"}
+logger = logging.getLogger(__name__)
 
 
 class PaddlePipeline(Protocol):
@@ -28,6 +30,7 @@ class PaddleOcrEngine:
 
             if self._engine is None:
                 self._engine = PaddleOCR(
+                    enable_mkldnn=False,
                     use_doc_orientation_classify=False,
                     use_doc_unwarping=False,
                     use_textline_orientation=False,
@@ -48,6 +51,7 @@ class PaddleOcrEngine:
                             texts.extend(str(value) for value in values)
             return texts
         except Exception as exc:
+            logger.exception("PaddleOCR failed while parsing an image")
             raise AttachmentProcessingError("failed to run PaddleOCR") from exc
 
 

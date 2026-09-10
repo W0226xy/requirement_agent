@@ -8,7 +8,9 @@ from requirement_agent.infrastructure.database.base import Base
 from requirement_agent.infrastructure.database.models import (
     AnalysisResult,
     AuditLog,
+    ConversationMessage,
     RequirementEmbedding,
+    RequirementConversation,
     SourceAttachment,
     SourceRecord,
 )
@@ -24,7 +26,9 @@ target_metadata = Base.metadata
 _REGISTERED_MODELS = (
     AnalysisResult,
     AuditLog,
+    ConversationMessage,
     RequirementEmbedding,
+    RequirementConversation,
     SourceAttachment,
     SourceRecord,
 )

@@ -13,8 +13,10 @@ from requirement_agent.ai.schemas.retrieval import RequirementCandidate
 from requirement_agent.infrastructure.database.base import Base
 from requirement_agent.infrastructure.database.models import (
     AnalysisResult,
+    ConversationMessage,
     FeatureLineage,
     Requirement,
+    RequirementConversation,
     RequirementFeature,
     RequirementVersion,
     ReviewTask,
@@ -193,6 +195,109 @@ async def test_workflow_rejects_requirement_outside_candidates(
     source = await workflow_session.get(SourceRecord, 1)
     assert source is not None
     assert source.processing_status == ProcessingStatus.ANALYSIS_FAILED
+
+
+async def test_context_is_isolated_bounded_and_updates_memory(
+    workflow_session: AsyncSession,
+) -> None:
+    same_source = SourceRecord(
+        id=2,
+        source_key="SRC-SAME-CONTEXT",
+        channel_type=ChannelType.WEB_FORM,
+        external_event_id="same-context-event",
+        submitter_id="user-1",
+        submitter_name="Tester",
+        raw_text="The export format must preserve dashboard filters.",
+        raw_metadata={"input_surface": "conversation"},
+        received_at=datetime.now(UTC),
+        processing_status=ProcessingStatus.PENDING_REVIEW,
+    )
+    other_source = SourceRecord(
+        id=3,
+        source_key="SRC-OTHER-CONTEXT",
+        channel_type=ChannelType.WEB_FORM,
+        external_event_id="other-context-event",
+        submitter_id="user-1",
+        submitter_name="Tester",
+        raw_text="SECRET FROM ANOTHER CONVERSATION",
+        raw_metadata={"input_surface": "conversation"},
+        received_at=datetime.now(UTC),
+        processing_status=ProcessingStatus.PENDING_REVIEW,
+    )
+    conversation = RequirementConversation(
+        conversation_key="CONV-CONTEXT",
+        owner_id="user-1",
+        title="Context",
+        summary="Reporting preferences",
+        business_context={"modules": ["reporting"]},
+    )
+    other_conversation = RequirementConversation(
+        conversation_key="CONV-OTHER",
+        owner_id="user-1",
+        title="Other",
+    )
+    workflow_session.add_all(
+        [same_source, other_source, conversation, other_conversation]
+    )
+    await workflow_session.flush()
+    workflow_session.add_all(
+        [
+            ConversationMessage(
+                message_key="MSG-SAME",
+                conversation_id=conversation.id,
+                source_record_id=same_source.id,
+                sequence_number=1,
+            ),
+            ConversationMessage(
+                message_key="MSG-CURRENT",
+                conversation_id=conversation.id,
+                source_record_id=1,
+                sequence_number=2,
+            ),
+            ConversationMessage(
+                message_key="MSG-OTHER",
+                conversation_id=other_conversation.id,
+                source_record_id=other_source.id,
+                sequence_number=1,
+            ),
+        ]
+    )
+    await workflow_session.commit()
+    workflow = RequirementAnalysisWorkflow(
+        workflow_session,
+        FakeLLM([extraction(), conflict()], model_name="fake-chat"),
+        FakeLLM([], model_name="fake-embedding"),
+        max_retries=2,
+        retrieval_weights=RetrievalWeights(keyword=0.4, vector=0.4, business=0.2),
+        candidate_limit=20,
+        retriever=FakeRetriever([candidate()]),
+        context_message_limit=1,
+        context_char_limit=500,
+        memory_summary_limit=80,
+    )
+
+    state = await workflow.run(1)
+    refreshed = await workflow_session.get(RequirementConversation, conversation.id)
+    extraction_record = (
+        await workflow_session.execute(
+            select(AnalysisResult)
+            .where(AnalysisResult.source_record_id == 1)
+            .order_by(AnalysisResult.id)
+        )
+    ).scalars().first()
+
+    assert "dashboard filters" in state["conversation_context"]
+    assert "SECRET FROM ANOTHER CONVERSATION" not in state["conversation_context"]
+    assert len(state["conversation_context"]) <= 500
+    assert extraction_record is not None
+    assert extraction_record.input_snapshot["conversation_context"] == state[
+        "conversation_context"
+    ]
+    assert refreshed is not None
+    assert refreshed.memory_revision == 1
+    assert refreshed.memory_covered_sequence == 2
+    assert refreshed.business_context["modules"] == ["reporting"]
+    assert "Export reports" in refreshed.summary
 
 
 async def test_embedding_failure_preserves_original_source(

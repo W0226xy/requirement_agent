@@ -7,7 +7,7 @@ const connectors = [
   { name: "网页表单", type: "web_form", description: "接收文本需求，使用 Idempotency-Key 防止重复事件。", ready: true },
   { name: "产品文档", type: "document", description: "支持 PDF 和 DOCX，原文件归档到 MinIO 后异步解析。", ready: true },
   { name: "截图", type: "image", description: "支持 PNG 和 JPEG，通过 PaddleOCR 提取文本。", ready: true },
-  { name: "飞书", type: "feishu", description: "事件签名、消息和附件下载将在阶段 6 接入。", ready: false },
+  { name: "飞书", type: "feishu", description: "支持 v2 事件验签、文本消息以及图片和文件附件下载。", ready: true },
 ];
 
 export function ConnectorsPage() {
@@ -19,7 +19,7 @@ export function ConnectorsPage() {
         showIcon
         icon={<SafetyCertificateOutlined />}
         message="安全说明"
-        description="密钥不在浏览器中编辑或展示。飞书凭据将在阶段 6 通过后端环境变量安全配置。"
+        description="密钥不在浏览器中编辑或展示。飞书凭据仅通过后端环境变量安全配置。"
       />
       <Row gutter={[16, 16]} className="section-card">
         {connectors.map((connector) => (

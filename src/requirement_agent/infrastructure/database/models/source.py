@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import (
     JSON,
@@ -18,6 +19,11 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from requirement_agent.infrastructure.database.base import Base
 from requirement_agent.shared.enums import AttachmentParseStatus, ChannelType, ProcessingStatus
+
+if TYPE_CHECKING:
+    from requirement_agent.infrastructure.database.models.conversation import (
+        ConversationMessage,
+    )
 
 BIGINT_PK = BigInteger().with_variant(Integer, "sqlite")
 JSON_DATA = JSON().with_variant(JSONB, "postgresql")
@@ -80,6 +86,12 @@ class SourceRecord(Base):
         cascade="save-update, merge",
         passive_deletes=True,
     )
+    conversation_message: Mapped["ConversationMessage | None"] = relationship(
+        back_populates="source_record",
+        uselist=False,
+    )
+
+
 class SourceAttachment(Base):
     __tablename__ = "source_attachment"
     __table_args__ = (

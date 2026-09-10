@@ -3,6 +3,10 @@ from requirement_agent.infrastructure.database.models.analysis import (
     RequirementEmbedding,
 )
 from requirement_agent.infrastructure.database.models.audit import AuditLog
+from requirement_agent.infrastructure.database.models.conversation import (
+    ConversationMessage,
+    RequirementConversation,
+)
 from requirement_agent.infrastructure.database.models.requirement import (
     FeatureLineage,
     Requirement,
@@ -15,8 +19,10 @@ from requirement_agent.infrastructure.database.models.source import SourceAttach
 __all__ = [
     "AnalysisResult",
     "AuditLog",
+    "ConversationMessage",
     "FeatureLineage",
     "Requirement",
+    "RequirementConversation",
     "RequirementEmbedding",
     "RequirementFeature",
     "RequirementVersion",

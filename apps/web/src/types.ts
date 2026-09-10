@@ -39,6 +39,35 @@ export type SourceRecord = {
   attachments: Attachment[];
 };
 
+export type Conversation = {
+  conversation_key: string;
+  owner_id: string;
+  title: string;
+  title_is_custom: boolean;
+  summary: string;
+  business_context: Record<string, unknown>;
+  memory_revision: number;
+  memory_covered_sequence: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ConversationMessage = {
+  message_key: string;
+  sequence_number: number;
+  role: string;
+  created_at: string;
+  source: SourceRecord;
+  latest_extraction: Record<string, unknown> | null;
+  latest_conflict_analysis: Record<string, unknown> | null;
+  review_task: ReviewTask | null;
+};
+
+export type CreateConversationMessageResponse = {
+  message: ConversationMessage;
+  replayed: boolean;
+};
+
 export type FeatureLineage = {
   source_record_id: number;
   introduced_version_id: number;

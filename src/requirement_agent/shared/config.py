@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import Field, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -31,6 +31,13 @@ class Settings(BaseSettings):
     minio_secure: bool = False
     max_upload_size_bytes: int = Field(default=52_428_800, gt=0)
 
+    feishu_app_id: str = ""
+    feishu_app_secret: SecretStr = SecretStr("")
+    feishu_verification_token: SecretStr = SecretStr("")
+    feishu_encrypt_key: SecretStr = SecretStr("")
+    feishu_base_url: str = "https://open.feishu.cn"
+    feishu_timeout_seconds: float = Field(default=10, gt=0, le=60)
+
     llm_base_url: str
     llm_api_key: str
     llm_model: str
@@ -45,6 +52,9 @@ class Settings(BaseSettings):
     retrieval_vector_weight: float = Field(default=0.4, ge=0, le=1)
     retrieval_business_weight: float = Field(default=0.2, ge=0, le=1)
     retrieval_candidate_limit: int = Field(default=20, ge=10, le=20)
+    conversation_context_message_limit: int = Field(default=8, ge=1, le=20)
+    conversation_context_char_limit: int = Field(default=6_000, gt=0)
+    conversation_memory_summary_limit: int = Field(default=2_000, gt=0)
 
     @model_validator(mode="after")
     def validate_retrieval_weights(self) -> "Settings":

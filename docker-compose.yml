@@ -3,6 +3,17 @@ name: requirement-agent
 x-common-env-file: &common-env-file
   - .env
 
+x-common-environment: &common-environment
+  FEISHU_APP_ID: ${FEISHU_APP_ID:-}
+  FEISHU_APP_SECRET: ${FEISHU_APP_SECRET:-}
+  FEISHU_VERIFICATION_TOKEN: ${FEISHU_VERIFICATION_TOKEN:-}
+  FEISHU_ENCRYPT_KEY: ${FEISHU_ENCRYPT_KEY:-}
+  FEISHU_BASE_URL: ${FEISHU_BASE_URL:-https://open.feishu.cn}
+  FEISHU_TIMEOUT_SECONDS: ${FEISHU_TIMEOUT_SECONDS:-10}
+  CONVERSATION_CONTEXT_MESSAGE_LIMIT: ${CONVERSATION_CONTEXT_MESSAGE_LIMIT:-8}
+  CONVERSATION_CONTEXT_CHAR_LIMIT: ${CONVERSATION_CONTEXT_CHAR_LIMIT:-6000}
+  CONVERSATION_MEMORY_SUMMARY_LIMIT: ${CONVERSATION_MEMORY_SUMMARY_LIMIT:-2000}
+
 services:
   api:
     build:
@@ -11,6 +22,7 @@ services:
     command: uvicorn apps.api.main:app --host 0.0.0.0 --port 8000 --reload
     env_file: *common-env-file
     environment:
+      <<: *common-environment
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/0
@@ -46,6 +58,7 @@ services:
       --queues=source_processing,celery
     env_file: *common-env-file
     environment:
+      <<: *common-environment
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/0
