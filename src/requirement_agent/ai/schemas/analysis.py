@@ -67,13 +67,13 @@ class ProposedOperation(StrictAIModel):
     #在 Pydantic 完成字段解析后，再检查字段组合是否符合业务规则。
     @model_validator(mode="after")
     def validate_operation_shape(self) -> "ProposedOperation":
-        if self.operation == ChangeOperation.ADD:
+        if self.operation == ChangeOperation.ADD:#ADD 操作要求 feature_key 为 null，content 不为 null
             if self.feature_key is not None or self.content is None:
                 raise ValueError("add requires null feature_key and non-null content")
-        elif self.operation in {ChangeOperation.MODIFY, ChangeOperation.RESTORE}:
+        elif self.operation in {ChangeOperation.MODIFY, ChangeOperation.RESTORE}:#MODIFY/RESTORE 操作要求 feature_key 不为 null，content 不为 null
             if self.feature_key is None or self.content is None:
                 raise ValueError(f"{self.operation.value} requires feature_key and content")
-        elif self.operation == ChangeOperation.DELETE:
+        elif self.operation == ChangeOperation.DELETE:#DELETE 操作要求 feature_key 不为 null，content 为 null
             if self.feature_key is None or self.content is not None:
                 raise ValueError("delete requires feature_key and null content")
         return self

@@ -84,7 +84,8 @@ from requirement_agent.shared.errors import (
     StructuredOutputError,
 )
 
-
+#是节点之间传递的数据容器，保存当前来源记录 ID、合并后的文本、提取结果、
+#候选历史需求、冲突分析结果、已有模块和会话上下文
 class AnalysisState(TypedDict, total=False):
     source_record_id: int#当前原始需求的数据库ID
     source_content: str#原始文本、附件解析文本和OCR文本，OCR文本是指从图片中识别出的文本。
@@ -108,8 +109,9 @@ class CandidateRetriever(Protocol):
         ...
 #规定了检索器必须提供一个异步search()方法。
 
+#注入数据库会话、聊天模型、向量模型等依赖，并注册四个节点。
 class RequirementAnalysisWorkflow:
-    def __init__(
+    def __init__(#注入数据库会话、聊天模型、向量模型等依赖，并注册四个节点。
         self,
         session: AsyncSession,#数据库会话对象，用于执行异步数据库操作。
         chat_model: ChatModel,#需求提取和冲突分析使用的大模型
@@ -129,7 +131,7 @@ class RequirementAnalysisWorkflow:
             session,
             max_retries=max_retries,
         )
-        self._retriever = retriever or HybridRetriever(#创建检索器
+        self._retriever = retriever or HybridRetriever(#创建检索器，这里用的混合检索器，结合向量检索和关键词检索，返回与当前需求最相关的历史需求。
             session,
             embedding_model,
             retrieval_weights,
@@ -171,6 +173,7 @@ class RequirementAnalysisWorkflow:
             return {"source_record_id": source_record_id}
         #3.合并原始文本、附件解析文本和OCR文本，形成完整的需求内容。
         content = self._source_content(source)
+        #加载会话上下文，获取当前需求所属会话中前面的消息，以及这些消息之前的提取结果和冲突分析结果，拼成一段上下文文本，传给大模型。
         conversation_context = await load_conversation_context(
             self._session,
             source_record_id,
@@ -265,7 +268,7 @@ class RequirementAnalysisWorkflow:
                 #使用向量检索和关键词检索结合的方式，返回与当前需求最相关的历史需求。
                 query,
                 source_record_id=source_id,
-                query_modules=extraction.functional_modules,
+                query_modules=extraction.functional_modules,#三个功能模块：验收条件、澄清问题、平台/页面/角色等实体信息
             )
             exact_candidates = await self._exact_duplicate_candidates(#精确重复检测，这里不是看文本相似度，而是看原始输入是否与历史需求完全一致。
                 source_id,
@@ -273,8 +276,7 @@ class RequirementAnalysisWorkflow:
             )
         except Exception:#检索失败处理
             #可能有如下情况：Embedding模型调用失败；PostgreSQL全文或向量查询失败；数据库连接失败；精确重复查询失败；
-            await self._set_status(source_id, ProcessingStatus.ANALYSIS_FAILED)#将当前需求的处理状态设置为ANALYSIS_FAILED，表示分析失败。
-            #严格从命名上说，这里发生的是“检索失败”，但项目目前使用统一的：ProcessingStatus.ANALYSIS_FAILED，表示分析失败，包括检索失败和分析失败。
+            await self._set_status(source_id, ProcessingStatus.RETRIEVING)#将当前需求的处理状态设置为RETRIEVING，表示正在进行历史需求检索。
             raise
         candidates_by_key = {#按requirement_key去重，如"REQ-001": candidate_1
             candidate.requirement_key: candidate for candidate in semantic_candidates

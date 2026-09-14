@@ -75,7 +75,7 @@ def rank_documents(
             deduplicated[key] = (document, score)
     # 按综合得分降序排序，并取前 limit 个结果
     ranked = sorted(deduplicated.values(), key=lambda item: item[1], reverse=True)
-    return [#这里使用 Pydantic，把内部检索结果转换成后续冲突分析节点可用的标准对象。
+    return [#这里使用 Pydantic，把内部检索结果转换成后续冲突分析节点可用的标准对象RequirementCandidate。
         RequirementCandidate.model_validate(
             {
                 "requirement_key": document.requirement_key,#需求唯一标识
@@ -108,15 +108,15 @@ class HybridRetriever:
 
     async def search(
         self,
-        query: str,
+        query: str,#当前新需求的检索文本，是_extract()提取出的requirement_summary + requirement_description
         *,
         source_record_id: int | None,
-        query_modules: list[str],
-        filters: SearchFilters | None = None,
+        query_modules: list[str],#当前需求的功能模块
+        filters: SearchFilters | None = None,#可选的检索范围限制，例如只查指定状态或指定模块
     ) -> list[RequirementCandidate]:
         started = perf_counter()
         try:
-            # 调用向量模型，将查询文本转换为向量表示
+            # 调用向量模型，将当前查询文本转换为向量表示
             query_embedding = (await self._embedding_model.embed([query]))[0]
         except Exception as exc:# 如果向量模型调用失败，记录错误信息到数据库，并重新抛出异常
             if source_record_id is not None:
@@ -140,7 +140,7 @@ class HybridRetriever:
                 started,
                 None,
             )
-        documents = await self._query_documents(
+        documents = await self._query_documents(#数据库三路检索：关键词检索 + 向量检索 + 业务模块匹配
             query,
             query_embedding,
             query_modules,
@@ -148,7 +148,7 @@ class HybridRetriever:
         )
         return rank_documents(documents, self._weights, self._candidate_limit)
 
-    async def _query_documents(
+    async def _query_documents(#执行实际数据库检索
         self,
         query: str,
         query_embedding: list[float],
