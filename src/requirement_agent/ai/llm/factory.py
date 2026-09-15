@@ -15,6 +15,7 @@ def get_llm() -> OpenAICompatibleChatModel:
         api_key=settings.llm_api_key,
         model=settings.llm_model,
         timeout_seconds=settings.llm_timeout_seconds,
+        max_tokens=settings.llm_max_completion_tokens,
     )
 
 

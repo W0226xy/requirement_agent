@@ -28,6 +28,7 @@ from requirement_agent.shared.enums import (
     ChannelType,
     FeatureStatus,
     ProcessingStatus,
+    RequirementChangeType,
     ReviewDecision,
     ReviewStatus,
 )
@@ -122,14 +123,31 @@ async def approve(
     *,
     requirement_id: int | None = None,
 ) -> RequirementVersion:
+    review_task_id = review.id
+    requirement = (
+        await session.get(Requirement, requirement_id)
+        if requirement_id is not None
+        else None
+    )
+    target_requirement_key = requirement.requirement_key if requirement else None
+    current_version = (
+        await session.get(RequirementVersion, requirement.current_version_id)
+        if requirement is not None and requirement.current_version_id is not None
+        else None
+    )
+    expected_current_version = current_version.version_number if current_version else None
+    if session.in_transaction():
+        await session.rollback()
     return await VersionCommitService(session).approve(
-        review_task_id=review.id,
+        review_task_id=review_task_id,
         reviewer_id="reviewer-1",
         decision=(
             ReviewDecision.MERGE if requirement_id is not None else ReviewDecision.CREATE
         ),
         title="Report exports" if requirement_id is None else None,
-        target_requirement_id=requirement_id,
+        target_requirement_key=target_requirement_key,
+        expected_requirement_id=requirement_id,
+        expected_current_version=expected_current_version,
         operations=[operation_value],
         comment="approved",
     )
@@ -211,6 +229,47 @@ async def test_create_and_all_feature_operations_are_versioned(
     ]
 
 
+async def test_merge_reuses_selected_requirement_and_creates_next_version(
+    version_session: AsyncSession,
+) -> None:
+    initial_review = await add_review(version_session, 1)
+    version1 = await approve(version_session, initial_review, operation(1, "add"))
+    target = await version_session.get(Requirement, version1.requirement_id)
+    assert target is not None
+
+    merge_review = await add_review(version_session, 2)
+    version2 = await VersionCommitService(version_session).approve(
+        review_task_id=merge_review.id,
+        reviewer_id="reviewer-1",
+        decision=ReviewDecision.MERGE,
+        title=None,
+        target_requirement_key=target.requirement_key,
+        expected_requirement_id=target.id,
+        expected_current_version=version1.version_number,
+        operations=[operation(2, "add", title="Export CSV")],
+        comment="Add CSV export to the existing requirement",
+    )
+    requirement_count = await version_session.scalar(select(func.count(Requirement.id)))
+    versions = (
+        await version_session.execute(
+            select(RequirementVersion)
+            .where(RequirementVersion.requirement_id == target.id)
+            .order_by(RequirementVersion.version_number)
+        )
+    ).scalars().all()
+    refreshed_target = await version_session.get(Requirement, target.id)
+
+    assert requirement_count == 1
+    assert version1.requirement_id == target.id
+    assert version2.requirement_id == target.id
+    assert [version.version_number for version in versions] == [1, 2]
+    assert versions[0].id == version1.id
+    assert version2.parent_version_id == version1.id
+    assert version2.change_type == RequirementChangeType.UPDATE
+    assert refreshed_target is not None
+    assert refreshed_target.current_version_id == version2.id
+
+
 async def test_repeated_approval_returns_same_version(
     version_session: AsyncSession,
 ) -> None:
@@ -221,7 +280,9 @@ async def test_repeated_approval_returns_same_version(
         reviewer_id="reviewer-1",
         decision=ReviewDecision.CREATE,
         title="Report exports",
-        target_requirement_id=None,
+        target_requirement_key=None,
+        expected_requirement_id=None,
+        expected_current_version=None,
         operations=[operation(1, "add")],
         comment=None,
     )
@@ -230,7 +291,9 @@ async def test_repeated_approval_returns_same_version(
         reviewer_id="reviewer-1",
         decision=ReviewDecision.CREATE,
         title="Ignored replay title",
-        target_requirement_id=None,
+        target_requirement_key=None,
+        expected_requirement_id=None,
+        expected_current_version=None,
         operations=[operation(1, "add")],
         comment=None,
     )
@@ -272,7 +335,9 @@ async def test_invalid_operation_rolls_back_entire_commit(
             reviewer_id="reviewer-1",
             decision=ReviewDecision.CREATE,
             title="Report exports",
-            target_requirement_id=None,
+            target_requirement_key=None,
+            expected_requirement_id=None,
+            expected_current_version=None,
             operations=[
                 operation(1, "add"),
                 operation(1, "modify", feature_key="FEAT-999"),

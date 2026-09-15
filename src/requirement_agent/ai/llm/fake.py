@@ -23,7 +23,12 @@ class FakeLLM:
     def model_name(self) -> str:
         return self._model_name
 
-    async def complete(self, messages: list[dict[str, str]]) -> str:
+    async def complete(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        analysis_type: str | None = None,
+    ) -> str:
         self.calls.append(messages)
         if not self._responses:
             raise RuntimeError("FakeLLM has no response configured")

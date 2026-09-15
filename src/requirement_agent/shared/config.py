@@ -45,14 +45,18 @@ class Settings(BaseSettings):
     embedding_api_key: str
     embedding_model: str
     embedding_dimension: int = Field(gt=0)
-    llm_timeout_seconds: float = Field(default=60, gt=0)
+    llm_timeout_seconds: float = Field(default=120, gt=0, le=600)
+    llm_max_completion_tokens: int = Field(default=4096, ge=256, le=32_768)
     llm_max_retries: int = Field(default=2, ge=0, le=2)
 
     retrieval_keyword_weight: float = Field(default=0.4, ge=0, le=1)
     retrieval_vector_weight: float = Field(default=0.4, ge=0, le=1)
     retrieval_business_weight: float = Field(default=0.2, ge=0, le=1)
     retrieval_candidate_limit: int = Field(default=20, ge=10, le=20)
+    retrieval_min_similarity_score: float = Field(default=0.40, ge=0, le=1)
+    # Used by memory updates (summary/business context), not prompt recent-message injection.
     conversation_context_message_limit: int = Field(default=8, ge=1, le=20)
+    conversation_context_recent_message_limit: int = Field(default=3, ge=1, le=20)
     conversation_context_char_limit: int = Field(default=6_000, gt=0)
     conversation_memory_summary_limit: int = Field(default=2_000, gt=0)
 

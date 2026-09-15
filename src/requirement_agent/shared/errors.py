@@ -58,6 +58,14 @@ class LLMServiceError(ApplicationError):
     code = "LLM_SERVICE_ERROR"
 
 
+class LLMEmptyContentError(LLMServiceError):
+    code = "LLM_EMPTY_CONTENT"
+
+
+class LLMOutputBudgetExceededError(LLMEmptyContentError):
+    code = "LLM_OUTPUT_BUDGET_EXCEEDED"
+
+
 class StructuredOutputError(ApplicationError):
     code = "STRUCTURED_OUTPUT_INVALID"
 

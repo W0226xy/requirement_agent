@@ -46,19 +46,35 @@ class ReviewTaskListResponse(BaseModel):
 
 
 class ApproveReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     decision: ReviewDecision
     title: str | None = Field(default=None, min_length=1, max_length=500)
-    target_requirement_id: int | None = Field(default=None, gt=0)
+    target_requirement_key: str | None = Field(default=None, min_length=1, max_length=64)
+    expected_requirement_id: int | None = Field(default=None, gt=0)
+    expected_current_version: int | None = Field(default=None, ge=1)
     operations: list[ReviewOperation] = Field(min_length=1)
     comment: str | None = Field(default=None, max_length=5_000)
 
     @model_validator(mode="after")
     def validate_decision(self) -> "ApproveReviewRequest":
         if self.decision == ReviewDecision.CREATE:
-            if not self.title or self.target_requirement_id is not None:
-                raise ValueError("create requires title and no target_requirement_id")
-        elif self.target_requirement_id is None:
-            raise ValueError("merge requires target_requirement_id")
+            if (
+                not self.title
+                or self.target_requirement_key is not None
+                or self.expected_requirement_id is not None
+                or self.expected_current_version is not None
+            ):
+                raise ValueError("create requires title and no merge target fields")
+        elif (
+            self.target_requirement_key is None
+            or self.expected_requirement_id is None
+            or self.expected_current_version is None
+        ):
+            raise ValueError(
+                "merge requires target_requirement_key, expected_requirement_id, "
+                "and expected_current_version"
+            )
         return self
 
 

@@ -163,6 +163,7 @@ async def search_requirements(
             business=settings.retrieval_business_weight,
         ),
         candidate_limit=settings.retrieval_candidate_limit,
+        min_similarity_score=settings.retrieval_min_similarity_score,
     )
     candidates = await retriever.search(
         payload.query,

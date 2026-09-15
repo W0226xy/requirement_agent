@@ -7,6 +7,21 @@ import { api, queryString } from "../api";
 import { ErrorBlock, PageTitle, StatusTag, formatDate } from "../components";
 import type { PageResponse, Requirement } from "../types";
 
+export function requirementListPath(
+  page: number,
+  keyword: string,
+  status: string,
+  module: string,
+) {
+  return `/api/v1/requirements${queryString({
+    page,
+    page_size: 20,
+    keyword,
+    status,
+    module,
+  })}`;
+}
+
 export function RequirementsPage() {
   const navigate = useNavigate();
   const [data, setData] = useState<PageResponse<Requirement> | null>(null);
@@ -15,6 +30,8 @@ export function RequirementsPage() {
   const [page, setPage] = useState(1);
   const [keyword, setKeyword] = useState("");
   const [status, setStatus] = useState("");
+  const [module, setModule] = useState("");
+  const [moduleOptions, setModuleOptions] = useState<string[]>([]);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -22,12 +39,7 @@ export function RequirementsPage() {
     try {
       setData(
         await api<PageResponse<Requirement>>(
-          `/api/v1/requirements${queryString({
-            page,
-            page_size: 20,
-            keyword,
-            status,
-          })}`,
+          requirementListPath(page, keyword, status, module),
         ),
       );
     } catch (caught) {
@@ -35,11 +47,17 @@ export function RequirementsPage() {
     } finally {
       setLoading(false);
     }
-  }, [keyword, page, status]);
+  }, [keyword, module, page, status]);
 
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    void api<{ items: string[] }>("/api/v1/requirements/modules")
+      .then((response) => setModuleOptions(response.items))
+      .catch((caught) => setError(caught));
+  }, []);
 
   return (
     <>
@@ -58,6 +76,18 @@ export function RequirementsPage() {
               setKeyword(value);
             }}
             style={{ width: 280 }}
+          />
+          <Select
+            value={module}
+            style={{ width: 180 }}
+            options={[
+              { value: "", label: "全部模块" },
+              ...moduleOptions.map((value) => ({ value, label: value })),
+            ]}
+            onChange={(value) => {
+              setPage(1);
+              setModule(value);
+            }}
           />
           <Select
             allowClear

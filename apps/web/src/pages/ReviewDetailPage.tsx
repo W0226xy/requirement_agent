@@ -1,4 +1,10 @@
-import { ArrowLeftOutlined, CheckOutlined, RedoOutlined } from "@ant-design/icons";
+import {
+  ArrowLeftOutlined,
+  CheckOutlined,
+  DeleteOutlined,
+  PlusOutlined,
+  RedoOutlined,
+} from "@ant-design/icons";
 import {
   Alert,
   Button,
@@ -7,6 +13,7 @@ import {
   Collapse,
   Descriptions,
   Divider,
+  Form,
   Input,
   List,
   message,
@@ -31,13 +38,16 @@ import {
   formatDate,
 } from "../components";
 import { useSession } from "../session";
-import type {
-  PageResponse,
-  ProposedOperation,
-  Requirement,
-  ReviewTask,
-  SourceRecord,
-} from "../types";
+import type { PageResponse, Requirement, ReviewTask, SourceRecord } from "../types";
+import {
+  applyTargetFeature,
+  buildApprovalRequest,
+  buildOperations,
+  changeOperationOptions,
+  newOperationFormValue,
+  proposedOperationsToFormValues,
+  type OperationFormValue,
+} from "./reviewOperationForm";
 
 export function ReviewDetailPage() {
   const { id } = useParams();
@@ -49,7 +59,10 @@ export function ReviewDetailPage() {
   const [decision, setDecision] = useState<"create" | "merge">("create");
   const [title, setTitle] = useState("");
   const [targetId, setTargetId] = useState<number | undefined>();
-  const [operationsText, setOperationsText] = useState("[]");
+  const [operationForms, setOperationForms] = useState<OperationFormValue[]>([]);
+  const [operationErrors, setOperationErrors] = useState<Record<string, string>>({});
+  const [targetRequirement, setTargetRequirement] = useState<Requirement | null>(null);
+  const [targetChanged, setTargetChanged] = useState(false);
   const [comment, setComment] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<unknown>(null);
@@ -65,29 +78,34 @@ export function ReviewDetailPage() {
         setSource(rawSource);
         setRequirements(requirementPage.items);
         setTitle(String(review.extraction_snapshot.requirement_summary ?? ""));
-        setOperationsText(
-          JSON.stringify(review.analysis_snapshot.proposed_operations ?? [], null, 2),
-        );
+        setOperationForms(proposedOperationsToFormValues(review.analysis_snapshot.proposed_operations));
       })
       .catch(setError);
   }, [id]);
 
-  const operations = useMemo(() => {
-    try {
-      const parsed = JSON.parse(operationsText) as unknown;
-      return Array.isArray(parsed) ? (parsed as ProposedOperation[]) : null;
-    } catch {
-      return null;
-    }
-  }, [operationsText]);
+  const generatedOperations = useMemo(
+    () => buildOperations(operationForms, source?.id ?? 0),
+    [operationForms, source?.id],
+  );
 
   if (error) return <ErrorBlock error={error} />;
   if (!task || !source) return <LoadingBlock />;
   const pending = task.review_status === "pending";
+  const sourceRecordId = source.id;
 
   async function approve() {
-    if (!operations?.length) {
-      void message.error("变更操作必须是非空 JSON 数组");
+    const built = buildOperations(operationForms, sourceRecordId);
+    setOperationErrors(built.errors);
+    if (!built.operations) {
+      void message.error(built.errors.operations ?? "请检查变更操作中的必填项");
+      return;
+    }
+    const target = requirements.find((item) => item.id === targetId);
+    if (
+      decision === "merge" &&
+      (!target || target.current_version_number === null)
+    ) {
+      void message.error("请选择有当前版本的目标需求");
       return;
     }
     setSubmitting(true);
@@ -96,23 +114,40 @@ export function ReviewDetailPage() {
         `/api/v1/review-tasks/${id}/approve`,
         {
           method: "POST",
-          body: JSON.stringify({
-            decision,
-            title: decision === "create" ? title : null,
-            target_requirement_id: decision === "merge" ? targetId : null,
-            operations,
-            comment: comment || null,
-          }),
+          body: JSON.stringify(buildApprovalRequest(decision, title, target, built.operations, comment)),
         },
         session,
       );
       void message.success("审核通过，正式版本已生成");
       navigate(`/requirements/${result.requirement_id}`);
     } catch (caught) {
-      setError(caught);
+      void message.error(approvalErrorMessage(caught));
     } finally {
       setSubmitting(false);
     }
+  }
+
+  async function selectTarget(nextTargetId: number) {
+    setTargetId(nextTargetId);
+    setTargetRequirement(null);
+    setTargetChanged(true);
+    setOperationForms((current) => current.map((item) => (
+      item.operation === "add" ? item : { ...item, featureKey: null }
+    )));
+    try {
+      setTargetRequirement(await api<Requirement>(`/api/v1/requirements/${nextTargetId}`));
+    } catch (caught) {
+      setError(caught);
+    }
+  }
+
+  function updateOperation(id: string, patch: Partial<OperationFormValue>) {
+    setOperationForms((current) => current.map((item) => item.id === id ? { ...item, ...patch } : item));
+    setOperationErrors((current) => {
+      const next = { ...current };
+      for (const key of Object.keys(patch)) delete next[`${id}.${key}`];
+      return next;
+    });
   }
 
   async function action(name: "reject" | "return" | "reanalyze") {
@@ -275,18 +310,50 @@ export function ReviewDetailPage() {
               value: item.id,
               label: `${item.requirement_key} · ${item.title}`,
             }))}
-            onChange={setTargetId}
+            onChange={(value) => void selectTarget(value)}
           />
         )}
-        <Typography.Text strong>变更操作（审核人可编辑）</Typography.Text>
-        <Input.TextArea
-          className="operation-editor"
-          value={operationsText}
-          disabled={!pending}
-          status={operations === null ? "error" : undefined}
-          autoSize={{ minRows: 12, maxRows: 28 }}
-          onChange={(event) => setOperationsText(event.target.value)}
-        />
+        {decision === "merge" && targetChanged && (
+          <Alert
+            type="warning"
+            showIcon
+            message="目标需求已切换"
+            description="已清除修改、删除、恢复操作的目标功能。请重新选择目标功能并检查表单内容。"
+          />
+        )}
+        <Typography.Text strong>变更操作</Typography.Text>
+        {operationErrors.operations && <Alert type="error" showIcon message={operationErrors.operations} />}
+        <Space direction="vertical" size="middle" className="operation-forms">
+          {operationForms.map((item, index) => {
+            const needsTarget = item.operation !== "add";
+            const hasContent = item.operation !== "delete";
+            const selectableFeatures = decision === "merge" ? targetRequirement?.features ?? [] : [];
+            return (
+              <Card
+                size="small"
+                key={item.id}
+                title={`变更项 ${index + 1}`}
+                extra={pending && <Button danger type="text" icon={<DeleteOutlined />} onClick={() => setOperationForms((current) => current.filter((value) => value.id !== item.id))}>删除当前变更项</Button>}
+              >
+                <Form layout="vertical">
+                  <Row gutter={12}>
+                    <Col xs={24} md={8}><Form.Item label="变更类型"><Select disabled={!pending} value={item.operation} options={changeOperationOptions} onChange={(operation) => updateOperation(item.id, { operation, featureKey: operation === "add" ? null : item.featureKey })} /></Form.Item></Col>
+                    {needsTarget && <Col xs={24} md={16}><Form.Item label="目标功能" validateStatus={operationErrors[`${item.id}.featureKey`] ? "error" : undefined} help={operationErrors[`${item.id}.featureKey`]}><Select disabled={!pending || decision !== "merge" || !targetRequirement} value={item.featureKey ?? undefined} placeholder={decision === "merge" ? "请选择已有功能" : "创建新需求时不能修改或删除已有功能"} options={selectableFeatures.map((feature) => ({ value: feature.feature_key, label: `${feature.feature_key} · ${feature.feature_title}` }))} onChange={(featureKey) => updateOperation(item.id, applyTargetFeature(item, featureKey, selectableFeatures))} /></Form.Item></Col>}
+                  </Row>
+                  {hasContent && <>
+                    <Form.Item label="功能模块" validateStatus={operationErrors[`${item.id}.module`] ? "error" : undefined} help={operationErrors[`${item.id}.module`]}><Input disabled={!pending} value={item.module} onChange={(event) => updateOperation(item.id, { module: event.target.value })} /></Form.Item>
+                    <Form.Item label="功能标题" validateStatus={operationErrors[`${item.id}.featureTitle`] ? "error" : undefined} help={operationErrors[`${item.id}.featureTitle`]}><Input disabled={!pending} value={item.featureTitle} onChange={(event) => updateOperation(item.id, { featureTitle: event.target.value })} /></Form.Item>
+                    <Form.Item label="功能描述" validateStatus={operationErrors[`${item.id}.featureDescription`] ? "error" : undefined} help={operationErrors[`${item.id}.featureDescription`]}><Input.TextArea disabled={!pending} value={item.featureDescription} autoSize={{ minRows: 2 }} onChange={(event) => updateOperation(item.id, { featureDescription: event.target.value })} /></Form.Item>
+                    <Form.Item label="验收标准"><Space direction="vertical" className="acceptance-list">{item.acceptanceCriteria.map((criterion, criterionIndex) => <Space key={criterionIndex}><Input disabled={!pending} value={criterion} onChange={(event) => updateOperation(item.id, { acceptanceCriteria: item.acceptanceCriteria.map((value, valueIndex) => valueIndex === criterionIndex ? event.target.value : value) })} /><Button disabled={!pending} danger icon={<DeleteOutlined />} onClick={() => updateOperation(item.id, { acceptanceCriteria: item.acceptanceCriteria.filter((_, valueIndex) => valueIndex !== criterionIndex) })} /></Space>)}<Button disabled={!pending} icon={<PlusOutlined />} onClick={() => updateOperation(item.id, { acceptanceCriteria: [...item.acceptanceCriteria, ""] })}>新增验收标准</Button></Space></Form.Item>
+                  </>}
+                  <Form.Item label="变更原因" validateStatus={operationErrors[`${item.id}.reason`] ? "error" : undefined} help={operationErrors[`${item.id}.reason`]}><Input.TextArea disabled={!pending} value={item.reason} autoSize={{ minRows: 2 }} onChange={(event) => updateOperation(item.id, { reason: event.target.value })} /></Form.Item>
+                </Form>
+              </Card>
+            );
+          })}
+        </Space>
+        {pending && <Button icon={<PlusOutlined />} onClick={() => setOperationForms((current) => [...current, newOperationFormValue()])}>新增变更项</Button>}
+        <Collapse items={[{ key: "final-json", label: "查看最终 JSON（高级/调试）", children: <Input.TextArea readOnly value={JSON.stringify(generatedOperations.operations ?? [], null, 2)} autoSize={{ minRows: 6, maxRows: 20 }} /> }]} />
         <Input.TextArea
           value={comment}
           disabled={!pending}
@@ -309,4 +376,13 @@ export function ReviewDetailPage() {
       </Card>
     </>
   );
+}
+
+function approvalErrorMessage(error: unknown): string {
+  const detail = error instanceof Error ? error.message : "提交失败，请稍后重试";
+  if (detail.includes("target requirement changed")) return "目标需求版本已变化，请刷新后重新选择目标需求。";
+  if (detail.includes("selected requirement does not match")) return "目标需求信息已变化，请重新选择后提交。";
+  if (detail.includes("merge requires")) return "合并目标信息不完整，请重新选择目标需求。";
+  if (detail.includes("all operations must reference")) return "变更操作来源不正确，请刷新审核任务后重试。";
+  return `提交失败：${detail}`;
 }

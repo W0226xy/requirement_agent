@@ -23,6 +23,7 @@ from requirement_agent.infrastructure.database.models import (
     SourceRecord,
 )
 from requirement_agent.shared.enums import (
+    AnalysisType,
     ChannelType,
     FeatureStatus,
     LineageOperationType,
@@ -122,19 +123,32 @@ def conflict(requirement_id: str = "REQ-001") -> dict[str, object]:
     }
 
 
-def candidate() -> RequirementCandidate:
+def candidate(
+    key: str = "REQ-001", *, similarity_score: float = 0.95
+) -> RequirementCandidate:
     return RequirementCandidate.model_validate(
         {
-            "requirement_key": "REQ-001",
+            "requirement_key": key,
             "version_number": 2,
             "title": "Export reports",
             "functional_modules": ["reporting"],
             "features": [],
-            "similarity_score": 0.95,
+            "similarity_score": similarity_score,
             "matched_text": "Export reports as PDF.",
             "sources": [],
         }
     )
+
+
+def insufficient_info_conflict() -> dict[str, object]:
+    return {
+        "conflict_status": "insufficient_info",
+        "related_requirement_ids": [],
+        "conflicts": [],
+        "risks": [],
+        "proposed_operations": [],
+        "clarification_questions": [],
+    }
 
 
 async def test_workflow_reaches_pending_review(
@@ -195,6 +209,75 @@ async def test_workflow_rejects_requirement_outside_candidates(
     source = await workflow_session.get(SourceRecord, 1)
     assert source is not None
     assert source.processing_status == ProcessingStatus.ANALYSIS_FAILED
+
+
+async def test_conflict_snapshot_filters_low_scores_before_limit(
+    workflow_session: AsyncSession,
+) -> None:
+    workflow = RequirementAnalysisWorkflow(
+        workflow_session,
+        FakeLLM([extraction(), insufficient_info_conflict()], model_name="fake-chat"),
+        FakeLLM([], model_name="fake-embedding"),
+        max_retries=2,
+        retrieval_weights=RetrievalWeights(keyword=0.4, vector=0.4, business=0.2),
+        candidate_limit=2,
+        retrieval_min_similarity_score=0.40,
+        retriever=FakeRetriever(
+            [
+                candidate("REQ-MUSIC", similarity_score=0.39),
+                candidate("REQ-HABIT", similarity_score=0.40),
+                candidate("REQ-RELATED", similarity_score=0.72),
+                candidate("REQ-LIMITED", similarity_score=0.91),
+            ]
+        ),
+    )
+
+    state = await workflow.run(1)
+    conflict_record = (
+        await workflow_session.execute(
+            select(AnalysisResult)
+            .where(AnalysisResult.analysis_type == AnalysisType.CONFLICT_RISK)
+            .order_by(AnalysisResult.id.desc())
+        )
+    ).scalar_one()
+    candidates = conflict_record.input_snapshot["candidates"]
+
+    assert [item["requirement_key"] for item in state["candidates"]] == [
+        "REQ-LIMITED",
+        "REQ-RELATED",
+    ]
+    assert [item["requirement_key"] for item in candidates] == [
+        "REQ-LIMITED",
+        "REQ-RELATED",
+    ]
+    assert all(item["similarity_score"] >= 0.40 for item in candidates)
+
+
+async def test_workflow_allows_empty_candidates_after_threshold(
+    workflow_session: AsyncSession,
+) -> None:
+    workflow = RequirementAnalysisWorkflow(
+        workflow_session,
+        FakeLLM([extraction(), insufficient_info_conflict()], model_name="fake-chat"),
+        FakeLLM([], model_name="fake-embedding"),
+        max_retries=2,
+        retrieval_weights=RetrievalWeights(keyword=0.4, vector=0.4, business=0.2),
+        candidate_limit=20,
+        retrieval_min_similarity_score=0.40,
+        retriever=FakeRetriever([candidate("REQ-LOW", similarity_score=0.39)]),
+    )
+
+    state = await workflow.run(1)
+    conflict_record = (
+        await workflow_session.execute(
+            select(AnalysisResult)
+            .where(AnalysisResult.analysis_type == AnalysisType.CONFLICT_RISK)
+            .order_by(AnalysisResult.id.desc())
+        )
+    ).scalar_one()
+
+    assert state["candidates"] == []
+    assert conflict_record.input_snapshot["candidates"] == []
 
 
 async def test_context_is_isolated_bounded_and_updates_memory(

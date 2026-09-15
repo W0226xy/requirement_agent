@@ -81,7 +81,9 @@ class VersionCommitService:
         reviewer_id: str,
         decision: ReviewDecision,
         title: str | None,
-        target_requirement_id: int | None,
+        target_requirement_key: str | None,
+        expected_requirement_id: int | None,
+        expected_current_version: int | None,
         operations: list[ProposedOperation],
         comment: str | None,
     ) -> RequirementVersion:
@@ -105,7 +107,11 @@ class VersionCommitService:
                     )
 
                 requirement, current_version = await self._resolve_requirement(
-                    decision, title, target_requirement_id
+                    decision,
+                    title,
+                    target_requirement_key,
+                    expected_requirement_id,
+                    expected_current_version,
                 )
                 features = (
                     [MutableFeature.from_model(item) for item in current_version.features]
@@ -243,12 +249,19 @@ class VersionCommitService:
         self,
         decision: ReviewDecision,
         title: str | None,
-        target_requirement_id: int | None,
+        target_requirement_key: str | None,
+        expected_requirement_id: int | None,
+        expected_current_version: int | None,
     ) -> tuple[Requirement, RequirementVersion | None]:
         if decision == ReviewDecision.CREATE:
-            if target_requirement_id is not None or not title:
+            if (
+                target_requirement_key is not None
+                or expected_requirement_id is not None
+                or expected_current_version is not None
+                or not title
+            ):
                 raise VersionOperationError(
-                    "create requires title and must not specify target_requirement_id"
+                    "create requires title and must not specify merge target fields"
                 )
             requirement = Requirement(
                 requirement_key=f"REQ-{uuid4().hex[:8].upper()}",
@@ -260,16 +273,27 @@ class VersionCommitService:
             self._session.add(requirement)
             await self._session.flush()
             return requirement, None
-        if target_requirement_id is None:
-            raise VersionOperationError("merge requires target_requirement_id")
+        if (
+            target_requirement_key is None
+            or expected_requirement_id is None
+            or expected_current_version is None
+        ):
+            raise VersionOperationError(
+                "merge requires target_requirement_key, expected_requirement_id, "
+                "and expected_current_version"
+            )
         existing_requirement = await self._session.scalar(
             select(Requirement)
-            .where(Requirement.id == target_requirement_id)
+            .where(Requirement.requirement_key == target_requirement_key)
             .with_for_update()
         )
         if existing_requirement is None:
             raise RequirementNotFoundError(
-                f"requirement {target_requirement_id} was not found"
+                f"requirement {target_requirement_key} was not found"
+            )
+        if existing_requirement.id != expected_requirement_id:
+            raise VersionOperationError(
+                "selected requirement does not match expected_requirement_id"
             )
         if existing_requirement.current_version_id is None:
             raise VersionOperationError("target requirement has no current version")
@@ -280,6 +304,10 @@ class VersionCommitService:
         )
         if current is None:
             raise VersionOperationError("current requirement version was not found")
+        if current.version_number != expected_current_version:
+            raise ReviewStateError(
+                "target requirement changed; refresh and choose its current version"
+            )
         return existing_requirement, current
 
     @staticmethod

@@ -1,15 +1,19 @@
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, select
+from sqlalchemy import cast, func, select, true
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.sql.elements import ColumnElement
+from sqlalchemy.sql.selectable import TableValuedAlias
 
 from requirement_agent.api.schemas.requirements import (
     FeatureLineageResponse,
     RequirementDiffResponse,
     RequirementFeatureResponse,
     RequirementListResponse,
+    RequirementModuleListResponse,
     RequirementResponse,
     RequirementVersionListResponse,
     RequirementVersionResponse,
@@ -41,7 +45,7 @@ async def list_requirements(
     if status is not None:
         filters.append(Requirement.status == status)
     if module is not None:
-        filters.append(Requirement.functional_modules.contains([module]))
+        filters.append(_has_functional_module(session, module))
     if keyword is not None:
         filters.append(Requirement.title.ilike(f"%{keyword}%"))
     if requirement_key is not None:
@@ -49,21 +53,49 @@ async def list_requirements(
     total = (
         await session.execute(select(func.count(Requirement.id)).where(*filters))
     ).scalar_one()
-    requirements = (
+    rows = (
         await session.execute(
-            select(Requirement)
+            select(Requirement, RequirementVersion.version_number)
+            .outerjoin(
+                RequirementVersion,
+                Requirement.current_version_id == RequirementVersion.id,
+            )
             .where(*filters)
             .order_by(Requirement.updated_at.desc(), Requirement.id.desc())
             .offset((page - 1) * page_size)
             .limit(page_size)
         )
-    ).scalars()
+    ).all()
     return RequirementListResponse(
-        items=[RequirementResponse.model_validate(item) for item in requirements],
+        items=[
+            RequirementResponse.model_validate(requirement).model_copy(
+                update={"current_version_number": version_number}
+            )
+            for requirement, version_number in rows
+        ],
         total=total,
         page=page,
         page_size=page_size,
     )
+
+
+@router.get("/modules", response_model=RequirementModuleListResponse)
+async def list_requirement_modules(
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> RequirementModuleListResponse:
+    """Return every module used by a formal requirement, without pagination."""
+    modules = _functional_module_values(session)
+    values = (
+        await session.execute(
+            select(modules.c.value)
+            .select_from(Requirement)
+            .join(modules, true())
+            .where(modules.c.value.is_not(None), modules.c.value != "")
+            .distinct()
+            .order_by(modules.c.value)
+        )
+    ).scalars()
+    return RequirementModuleListResponse(items=list(values))
 
 
 @router.get("/{requirement_id}", response_model=RequirementResponse)
@@ -222,3 +254,21 @@ def _feature_response(
         FeatureLineageResponse.model_validate(item) for item in lineage
     ]
     return response
+
+
+def _functional_module_values(session: AsyncSession) -> TableValuedAlias:
+    """Expose the JSON array elements using the function for the active dialect."""
+    if session.bind is not None and session.bind.dialect.name == "postgresql":
+        return func.jsonb_array_elements_text(Requirement.functional_modules).table_valued(
+            "value"
+        )
+    return func.json_each(Requirement.functional_modules).table_valued("value")
+
+
+def _has_functional_module(
+    session: AsyncSession, module: str
+) -> ColumnElement[bool]:
+    if session.bind is not None and session.bind.dialect.name == "postgresql":
+        return cast(Requirement.functional_modules, JSONB).contains([module])
+    modules = _functional_module_values(session)
+    return select(1).select_from(modules).where(modules.c.value == module).exists()

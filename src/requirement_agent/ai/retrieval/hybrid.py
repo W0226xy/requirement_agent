@@ -64,6 +64,7 @@ def rank_documents(
     documents: list[ScoredDocument],
     weights: RetrievalWeights,
     limit: int,
+    min_similarity_score: float = 0.4,
 ) -> list[RequirementCandidate]:
     deduplicated: dict[tuple[str, int], tuple[ScoredDocument, float]] = {}
     for document in documents:
@@ -73,8 +74,16 @@ def rank_documents(
         previous = deduplicated.get(key)
         if previous is None or score > previous[1]:
             deduplicated[key] = (document, score)
-    # 按综合得分降序排序，并取前 limit 个结果
-    ranked = sorted(deduplicated.values(), key=lambda item: item[1], reverse=True)
+    # 仅以最终混合得分筛选；筛选后才排序并应用候选数量限制。
+    ranked = sorted(
+        (
+            item
+            for item in deduplicated.values()
+            if item[1] >= min_similarity_score
+        ),
+        key=lambda item: item[1],
+        reverse=True,
+    )
     return [#这里使用 Pydantic，把内部检索结果转换成后续冲突分析节点可用的标准对象RequirementCandidate。
         RequirementCandidate.model_validate(
             {
@@ -100,11 +109,13 @@ class HybridRetriever:
         weights: RetrievalWeights,#三种得分的融合权重
         *,
         candidate_limit: int,#限制返回的候选需求数量
+        min_similarity_score: float = 0.4,
     ) -> None:
         self._session = session
         self._embedding_model = embedding_model
         self._weights = weights
         self._candidate_limit = candidate_limit
+        self._min_similarity_score = min_similarity_score
 
     async def search(
         self,
@@ -146,7 +157,12 @@ class HybridRetriever:
             query_modules,
             filters or SearchFilters(),
         )
-        return rank_documents(documents, self._weights, self._candidate_limit)
+        return rank_documents(
+            documents,
+            self._weights,
+            self._candidate_limit,
+            self._min_similarity_score,
+        )
 
     async def _query_documents(#执行实际数据库检索
         self,

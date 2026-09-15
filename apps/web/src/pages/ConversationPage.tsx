@@ -413,7 +413,9 @@ export function ConversationPage() {
           body: JSON.stringify({
             decision: "create",
             title: draft.title.trim(),
-            target_requirement_id: null,
+            target_requirement_key: null,
+            expected_requirement_id: null,
+            expected_current_version: null,
             operations: [operation],
             comment: "用户确认保留该需求",
           }),

@@ -34,10 +34,10 @@ from requirement_agent.shared.errors import (
 
 @dataclass(frozen=True)
 class IngestionResult:
-    source: SourceRecord#被摄取的源记录
+    source: SourceRecord#本次原始需求记录
     replayed: bool#是否为重复提交
 
-
+#ingestion service 负责将不同来源的输入（文件、网页表单等）统一处理为源记录，并存储到数据库和对象存储中，同时派发任务给 Celery 进行后续处理。
 class IngestionService:
     def __init__(
         self,
@@ -46,10 +46,10 @@ class IngestionService:
         dispatcher: TaskDispatcher,#将解析、Agent 分析等任务投递给 Celery
         max_upload_size: int,#上传附件的最大大小限制
     ) -> None:
-        self._session = session
-        self._storage = storage
-        self._dispatcher = dispatcher
-        self._max_upload_size = max_upload_size
+        self._session = session#异步操作 PostgreSQL 数据库
+        self._storage = storage#操作对象存储，当前实现一般是 MinIO
+        self._dispatcher = dispatcher#将解析、Agent 分析等任务投递给 Celery
+        self._max_upload_size = max_upload_size#上传附件的最大大小限制
 
     async def ingest(
         self,
@@ -62,7 +62,7 @@ class IngestionService:
         #request 是对应的输入对象，例如 FileConnectorRequest、WebFormConnectorRequest 等
 
         #Connector 先统一不同来源的输入
-        #校验网页表单是否有有效文本；文件 Connector 是否收到了附件；
+        #校验网页表单是否有有效文本；文件 Connector 是否收到了附件；飞书事件：事件结构、签名或消息内容是否有效。
         if not await connector.verify(request):
             raise ConnectorVerificationError("connector rejected the input")
 
@@ -74,8 +74,9 @@ class IngestionService:
         normalized_attachments = self._validate_attachments(attachments)
 
         #幂等控制：避免重复创建需求
-        fingerprint = self._fingerprint(source_input, normalized_attachments)
-        existing = await self._find_existing(source_input)
+        fingerprint = self._fingerprint(source_input, normalized_attachments)#根据本次文本和附件内容生成摘要，用于确认“重复请求的内容是否真的一致”。
+        existing = await self._find_existing(source_input)#按渠道事件 ID、幂等键等查找是否已有同一条提交
+
         #如果已经存在相同的源记录，则检查其 payload 是否一致，如果一致则直接返回已存在的记录，并标记为 replayed=True
         if existing is not None:
             self._assert_same_payload(existing, fingerprint)
@@ -83,6 +84,7 @@ class IngestionService:
                 self._dispatch(existing)
             return IngestionResult(source=existing, replayed=True)
 
+        #新的提交，创建数据库记录和对象存储文件
         #创建原始需求记录 SourceRecord
         source = self._build_source(source_input, fingerprint)
         attachment_models = [
@@ -108,9 +110,10 @@ class IngestionService:
                 )
             )
             await self._session.commit()
-        except IntegrityError:
+        except IntegrityError:#处理的是并发重复提交
+            #例如用户连续点击两次提交，两个请求几乎同时发现“数据库里还没有记录”，都尝试插入。
+            #一个成功，另一个会触发唯一约束错误；失败方回滚后重新查找，复用刚刚成功创建的记录，避免生成两条重复需求。
             await self._session.rollback()
-            #如果数据库写入失败，可能是因为重复提交了相同的 external_event_id，这时再查找一次是否已经存在相同的源记录
             existing = await self._find_existing(source_input)
             if existing is None:
                 raise
@@ -134,15 +137,15 @@ class IngestionService:
             ) from exc
 
         #派发源记录到下游处理
-        #它会把 source.id 投递给 Celery Worker。之后才进入后台流程：
+        #它会把 source.id 投递给 Celery Worker，进入PARSE_SOURCE_TASK，之后才进入后台流程：
         if dispatch:
             self._dispatch(source)
         return IngestionResult(source=source, replayed=False)
 
-    def dispatch(self, source: SourceRecord) -> None:
+    def dispatch(self, source: SourceRecord) -> None:#外部调用接口，直接派发源记录到下游处理
         self._dispatch(source)
 
-    def _validate_attachments(
+    def _validate_attachments(#校验附件的文件名、类型、大小等，并返回标准化后的附件列表
         self,
         attachments: list[AttachmentInput],
     ) -> list[AttachmentInput]:
@@ -155,7 +158,7 @@ class IngestionService:
                 self._max_upload_size,
             )
             normalized.append(
-                AttachmentInput(
+                AttachmentInput(#校验后不直接改原附件，而是重新创建一个安全版本，也就是标准化后的附件列表
                     file_name=safe_name,
                     file_type=attachment.file_type,
                     content=attachment.content,
@@ -163,10 +166,11 @@ class IngestionService:
             )
         return normalized
 
+    #查找是否已有同一条提交，按渠道事件 ID、幂等键等查找
     async def _find_existing(self, source: RawSourceInput) -> SourceRecord | None:
         result = await self._session.execute(
             select(SourceRecord)
-            .options(selectinload(SourceRecord.attachments))
+            .options(selectinload(SourceRecord.attachments))#表示查询源记录时，把附件也一并加载出来，避免后续访问 source.attachments 时再额外查询数据库。
             .where(
                 SourceRecord.channel_type == source.channel_type,
                 SourceRecord.external_event_id == source.external_event_id,
@@ -175,6 +179,8 @@ class IngestionService:
         return result.scalar_one_or_none()
 
     @staticmethod
+    #检查已有源记录的 payload 是否与当前请求一致，如果不一致则抛出幂等性冲突错误
+    #防止“同一个幂等键却提交了不同内容”
     def _assert_same_payload(source: SourceRecord, fingerprint: str) -> None:
         if source.raw_metadata.get("_ingestion_fingerprint") != fingerprint:
             raise IdempotencyConflictError(
@@ -182,7 +188,7 @@ class IngestionService:
             )
 
     @staticmethod
-    def _fingerprint(
+    def _fingerprint(#用源数据和附件内容生成唯一指纹，作为幂等性控制的依据
         source: RawSourceInput,
         attachments: list[AttachmentInput],
     ) -> str:
@@ -204,6 +210,7 @@ class IngestionService:
         return hashlib.sha256(serialized.encode()).hexdigest()
 
     @staticmethod
+    #根据源数据和指纹构建源记录
     def _build_source(source: RawSourceInput, fingerprint: str) -> SourceRecord:
         metadata = dict(source.raw_metadata)
         metadata["_ingestion_fingerprint"] = fingerprint
@@ -220,6 +227,7 @@ class IngestionService:
         )
 
     @staticmethod
+    #根据源数据和附件构建附件记录
     def _build_attachment(
         source: RawSourceInput,
         attachment: AttachmentInput,
@@ -238,6 +246,7 @@ class IngestionService:
             parse_status=AttachmentParseStatus.PENDING,
         )
 
+    #将附件内容写入对象存储（MinIO），并记录审计日志
     async def _store_attachments(
         self,
         source: SourceRecord,
@@ -265,6 +274,7 @@ class IngestionService:
             )
         await self._session.commit()
 
+    #把源记录 ID 发送到 Celery Worker，进入 PARSE_SOURCE_TASK 阶段，之后才进入后台流程
     def _dispatch(self, source: SourceRecord) -> None:
         try:
             self._dispatcher.dispatch_source(source.id)
@@ -273,6 +283,7 @@ class IngestionService:
                 f"source {source.source_key} was saved, but its task could not be queued"
             ) from exc
 
+    #处理 MinIO 上传失败，当附件存储失败时，将源记录标记为解析失败，并记录错误信息到审计日志中
     async def _mark_storage_failure(
         self,
         source: SourceRecord,

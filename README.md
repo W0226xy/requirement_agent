@@ -295,10 +295,26 @@ curl -X POST 'http://localhost:8000/api/v1/review-tasks/1/approve' \
   }'
 ```
 
-合并到已有需求时使用 `"decision": "merge"` 并传入 `target_requirement_id`。审核人可在
-提交前编辑 `operations`，但只能使用 `add`、`modify`、`delete`、`restore`。后端会
-锁定审核任务和需求、验证功能状态、生成完整快照及差异、记录来源和审计，并在同一事务
-中更新当前版本指针。重复提交同一审核任务会返回首次生成的版本，不会创建重复版本。
+合并到已有需求时使用 `"decision": "merge"`，并传入下拉框所选需求的
+`target_requirement_key`、`expected_requirement_id` 和 `expected_current_version`。后端按
+key 锁定目标需求，再校验 ID 与当前版本，避免陈旧页面或字段错配误写到新需求。审核人可在
+提交前编辑 `operations`，但只能使用 `add`、`modify`、`delete`、`restore`。后端会锁定
+审核任务和需求、验证功能状态、生成完整快照及差异、记录来源和审计，并在同一事务中更新
+当前版本指针。重复提交同一审核任务会返回首次生成的版本，不会创建重复版本。
+
+例如将审核任务合并到列表中选定的 `REQ-8F2A19CD`（ID `42`、当前 v3）：
+
+```json
+{
+  "decision": "merge",
+  "title": null,
+  "target_requirement_key": "REQ-8F2A19CD",
+  "expected_requirement_id": 42,
+  "expected_current_version": 3,
+  "operations": [{ "operation": "add", "feature_key": null, "content": { "module": "报表", "feature_title": "导出 CSV", "feature_description": "支持 CSV 导出", "acceptance_criteria": ["可下载 CSV"] }, "source_record_id": 1, "reason": "新增格式" }],
+  "comment": "合并到现有需求"
+}
+```
 
 退回、驳回和重新分析：
 

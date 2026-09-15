@@ -268,6 +268,7 @@ async def analyze_source(source_record_id: int) -> None:
                 business=settings.retrieval_business_weight,
             ),
             candidate_limit=settings.retrieval_candidate_limit,#检索候选项限制
+            retrieval_min_similarity_score=settings.retrieval_min_similarity_score,
         )
         await workflow.run(source_record_id)#运行工作流，分析指定的原始需求记录 ID。工作流内部会调用 LLM、检索数据库、生成结构化结果，并写入数据库。
 

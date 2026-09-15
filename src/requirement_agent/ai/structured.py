@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Callable
 from time import perf_counter
 from typing import TypeVar
@@ -9,6 +10,8 @@ from requirement_agent.ai.llm.base import ChatModel
 from requirement_agent.infrastructure.database.models import AnalysisResult
 from requirement_agent.shared.enums import AnalysisType
 from requirement_agent.shared.errors import LLMServiceError, StructuredOutputError
+
+logger = logging.getLogger(__name__)
 
 #泛型：支持不同的输出 Schema
 #StructuredLLM 不绑定某一种结果结构，只要是 Pydantic BaseModel 子类都可以使用。
@@ -52,8 +55,20 @@ class StructuredLLM:
             started = perf_counter()
             raw_output: str | None = None
             try:
+                logger.info(
+                    "structured_llm_request analysis_type=%s model_name=%s attempt=%s "
+                    "message_count=%s input_chars=%s",
+                    analysis_type.value,
+                    self._model.model_name,
+                    attempt,
+                    len(current_messages),
+                    sum(len(message["content"]) for message in current_messages),
+                )
                 #调用 LLM 生成原始输出
-                raw_output = await self._model.complete(current_messages)
+                raw_output = await self._model.complete(
+                    current_messages,
+                    analysis_type=analysis_type.value,
+                )
                 #将原始输出解析为 Pydantic 对象,并进行校验(比如字段是否完整、类型是否正确、格式是否符合要求等)
                 result = schema.model_validate_json(raw_output)
                 #额外业务校验，比如某些字段的值是否在允许范围内，或者某些字段之间的关系是否符合业务规则等
@@ -95,7 +110,16 @@ class StructuredLLM:
                     f"model output remained invalid after {attempt} attempts"
                 ) from exc
             except LLMServiceError as exc:#LLM 服务调用失败，比如网络错误、超时、模型不可用等
-                last_error = str(exc)
+                last_error = f"{type(exc).__name__}: {exc}"
+                logger.warning(
+                    "structured_llm_service_error analysis_type=%s model_name=%s "
+                    "attempt=%s error_type=%s duration_ms=%s",
+                    analysis_type.value,
+                    self._model.model_name,
+                    attempt,
+                    type(exc).__name__,
+                    self._duration_ms(started),
+                )
                 await self._record(
                     source_record_id=source_record_id,
                     analysis_type=analysis_type,

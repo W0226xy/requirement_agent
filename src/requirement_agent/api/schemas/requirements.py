@@ -40,6 +40,7 @@ class RequirementResponse(BaseModel):
     requirement_key: str
     title: str
     current_version_id: int | None
+    current_version_number: int | None = None
     status: RequirementStatus
     functional_modules: list[str]
     extra_fields: dict[str, object]
@@ -53,6 +54,10 @@ class RequirementListResponse(BaseModel):
     total: int
     page: int
     page_size: int
+
+
+class RequirementModuleListResponse(BaseModel):
+    items: list[str]
 
 
 class RequirementVersionResponse(BaseModel):

@@ -6,7 +6,12 @@ class ChatModel(Protocol):
     def model_name(self) -> str:
         ...
 
-    async def complete(self, messages: list[dict[str, str]]) -> str:
+    async def complete(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        analysis_type: str | None = None,
+    ) -> str:
         ...
 
 
@@ -17,4 +22,3 @@ class EmbeddingModel(Protocol):
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         ...
-

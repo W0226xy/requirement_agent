@@ -92,7 +92,9 @@ async def approve_review(
         reviewer_id=reviewer_id,
         decision=payload.decision,
         title=payload.title,
-        target_requirement_id=payload.target_requirement_id,
+        target_requirement_key=payload.target_requirement_key,
+        expected_requirement_id=payload.expected_requirement_id,
+        expected_current_version=payload.expected_current_version,
         operations=[operation.to_domain() for operation in payload.operations],
         comment=payload.comment,
     )

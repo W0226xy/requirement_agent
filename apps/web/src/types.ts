@@ -92,6 +92,7 @@ export type Requirement = {
   requirement_key: string;
   title: string;
   current_version_id: number | null;
+  current_version_number: number | null;
   status: string;
   functional_modules: string[];
   extra_fields: Record<string, unknown>;
