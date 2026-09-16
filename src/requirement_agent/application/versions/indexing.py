@@ -29,6 +29,9 @@ from requirement_agent.shared.errors import RequirementNotFoundError
 # → commit
 # → HNSW 索引自动纳入新向量
 
+
+#先读取一个正式需求版本，并只选择状态为 ACTIVE 的功能项
+#然后为一个需求构造两类索引文档:需求级文档和功能级文档
 async def index_requirement_version(
     session: AsyncSession,
     embedding_model: EmbeddingModel,

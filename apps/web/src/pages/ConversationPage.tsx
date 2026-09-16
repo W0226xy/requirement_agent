@@ -367,6 +367,25 @@ export function ConversationPage() {
     }
   }
 
+  async function clearModelContext() {
+    if (!conversationKey) return;
+    try {
+      const updated = await api<Conversation>(
+        `/api/v1/conversations/${encodeURIComponent(conversationKey)}/clear-context`,
+        { method: "POST" },
+        session,
+      );
+      setConversations((current) =>
+        current.map((item) =>
+          item.conversation_key === updated.conversation_key ? updated : item,
+        ),
+      );
+      void message.success("已清空模型上下文，历史需求和审核记录仍会保留");
+    } catch (caught) {
+      setError(caught);
+    }
+  }
+
   function openDraft(source: SourceRecord, task: ReviewTask) {
     const extraction = task.extraction_snapshot;
     const modules = stringArray(extraction.functional_modules);
@@ -630,6 +649,17 @@ export function ConversationPage() {
             <Tag icon={<LoadingOutlined />} color="processing">
               AI 分析中
             </Tag>
+          )}
+          {!hasActiveTurn && activeConversation && (
+            <Popconfirm
+              title="清空模型上下文？"
+              description="不会删除需求、附件、版本、审核或审计记录。"
+              onConfirm={() => void clearModelContext()}
+              okText="清空"
+              cancelText="取消"
+            >
+              <Button size="small">清空模型上下文</Button>
+            </Popconfirm>
           )}
         </div>
 

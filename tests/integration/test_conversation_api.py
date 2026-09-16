@@ -179,3 +179,29 @@ async def test_message_rejects_wrong_owner(conversation_client: TestClient) -> N
         },
     )
     assert response.status_code == 404
+
+
+async def test_clear_context_keeps_messages_and_sources(
+    conversation_client: TestClient,
+) -> None:
+    headers = {"X-Actor-ID": "owner-1", "Idempotency-Key": "clear-context-0001"}
+    created = conversation_client.post("/api/v1/conversations", headers=headers)
+    key = created.json()["conversation_key"]
+    posted = conversation_client.post(
+        f"/api/v1/conversations/{key}/messages",
+        data={"raw_text": "仍需保留的原始需求"},
+        headers=headers,
+    )
+    cleared = conversation_client.post(
+        f"/api/v1/conversations/{key}/clear-context", headers=headers
+    )
+    messages = conversation_client.get(
+        f"/api/v1/conversations/{key}/messages", headers=headers
+    )
+
+    assert posted.status_code == 202
+    assert cleared.status_code == 200
+    assert cleared.json()["summary"] == ""
+    assert cleared.json()["memory_covered_sequence"] == 1
+    assert messages.json()["total"] == 1
+    assert messages.json()["items"][0]["source"]["raw_text"] == "仍需保留的原始需求"

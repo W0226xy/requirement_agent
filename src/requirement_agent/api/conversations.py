@@ -150,6 +150,19 @@ async def delete_conversation(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+@router.post("/{conversation_key}/clear-context", response_model=ConversationResponse)
+async def clear_conversation_context(
+    conversation_key: str,
+    actor_id: Annotated[str, Depends(get_actor_id)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+    ingestion_service: Annotated[IngestionService, Depends(get_ingestion_service)],
+) -> ConversationResponse:
+    conversation = await _service(session, ingestion_service).clear_model_context(
+        conversation_key, actor_id
+    )
+    return ConversationResponse.model_validate(conversation)
+
+
 @router.get(
     "/{conversation_key}/messages",
     response_model=ConversationMessageListResponse,

@@ -99,6 +99,25 @@ class ConversationService:
         conversation.updated_at = now
         await self._session.commit()
 
+    async def clear_model_context(
+        self, conversation_key: str, owner_id: str
+    ) -> RequirementConversation:
+        """Forget prompt memory without deleting auditable business records."""
+        conversation = await self.get(conversation_key, owner_id, for_update=True)
+        last_sequence = await self._session.scalar(
+            select(func.coalesce(func.max(ConversationMessage.sequence_number), 0)).where(
+                ConversationMessage.conversation_id == conversation.id
+            )
+        )
+        conversation.summary = ""
+        conversation.business_context = {}
+        conversation.memory_covered_sequence = last_sequence or 0
+        conversation.memory_revision += 1
+        conversation.updated_at = datetime.now(UTC)
+        await self._session.commit()
+        await self._session.refresh(conversation)
+        return conversation
+
     async def add_message(
         self,
         *,

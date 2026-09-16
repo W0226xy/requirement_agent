@@ -280,7 +280,7 @@ async def test_workflow_allows_empty_candidates_after_threshold(
     assert conflict_record.input_snapshot["candidates"] == []
 
 
-async def test_context_is_isolated_bounded_and_updates_memory(
+async def test_context_is_isolated_bounded_without_sync_memory_update(
     workflow_session: AsyncSession,
 ) -> None:
     same_source = SourceRecord(
@@ -377,10 +377,10 @@ async def test_context_is_isolated_bounded_and_updates_memory(
         "conversation_context"
     ]
     assert refreshed is not None
-    assert refreshed.memory_revision == 1
-    assert refreshed.memory_covered_sequence == 2
+    assert refreshed.memory_revision == 0
+    assert refreshed.memory_covered_sequence == 0
     assert refreshed.business_context["modules"] == ["reporting"]
-    assert "Export reports" in refreshed.summary
+    assert refreshed.summary == "Reporting preferences"
 
 
 async def test_embedding_failure_preserves_original_source(

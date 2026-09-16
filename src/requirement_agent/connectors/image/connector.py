@@ -7,20 +7,20 @@ from requirement_agent.domain.sources.entities import (
 )
 from requirement_agent.shared.enums import ChannelType
 
-IMAGE_TYPES = {"image/jpeg", "image/png"}
+IMAGE_TYPES = {"image/jpeg", "image/png"}#支持的图片类型
 
 
 class ImageConnector:
     def __init__(self) -> None:
-        self._attachment: AttachmentInput | None = None
+        self._attachment: AttachmentInput | None = None#用来暂时保存当前请求中的图片附件
 
-    async def verify(self, request: Any) -> bool:
+    async def verify(self, request: Any) -> bool:#初步校验图片请求
         return (
-            isinstance(request, FileConnectorRequest)
-            and request.attachment.file_type in IMAGE_TYPES
+            isinstance(request, FileConnectorRequest)#检查请求类型是否为 FileConnectorRequest
+            and request.attachment.file_type in IMAGE_TYPES#检查附件的文件类型是否在支持的图片类型集合中
         )
 
-    async def receive(self, request: Any) -> RawSourceInput:
+    async def receive(self, request: Any) -> RawSourceInput:#把图片请求转换成系统内部的 RawSourceInput 原始需求对象
         if not isinstance(request, FileConnectorRequest):
             raise TypeError("request must be a FileConnectorRequest")
         self._attachment = request.attachment

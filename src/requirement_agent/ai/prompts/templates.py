@@ -1,5 +1,19 @@
 EXTRACTION_PROMPT_VERSION = "requirement-extraction-v4"
 CONFLICT_PROMPT_VERSION = "conflict-risk-v4"
+CONVERSATION_SUMMARY_PROMPT_VERSION = "conversation-summary-v1"
+
+CONVERSATION_SUMMARY_SYSTEM_PROMPT = """
+你是会话记忆压缩器。只能根据提供的旧摘要和消息事实总结，禁止编造。
+必须严格输出以下六个中文标题（每个标题一行），不要输出其他标题或工具细节：
+已确认需求：
+待确认问题：
+已分析来源：
+已发现冲突或关联：
+审核与版本状态：
+已失效或被替代信息：
+保留需求编号、SourceRecord ID、版本状态、审核结论和用户最终确认的决定。
+忽略临时闲聊、重复描述、PDF/OCR 全文和工具执行过程；无内容时写“无”。
+""".strip()
 
 EXTRACTION_SYSTEM_PROMPT = """
 You extract product requirements.

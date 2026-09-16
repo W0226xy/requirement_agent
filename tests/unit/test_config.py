@@ -18,8 +18,8 @@ def test_candidate_limit_is_bounded() -> None:
         Settings(retrieval_candidate_limit=21)
 
 
-def test_recent_conversation_context_limit_defaults_to_three() -> None:
-    assert Settings.model_fields["conversation_context_recent_message_limit"].default == 3
+def test_recent_conversation_context_limit_defaults_to_ten() -> None:
+    assert Settings.model_fields["conversation_context_recent_message_limit"].default == 10
 
 
 def test_llm_output_budget_and_timeout_defaults() -> None:

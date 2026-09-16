@@ -54,11 +54,13 @@ class Settings(BaseSettings):
     retrieval_business_weight: float = Field(default=0.2, ge=0, le=1)
     retrieval_candidate_limit: int = Field(default=20, ge=10, le=20)
     retrieval_min_similarity_score: float = Field(default=0.40, ge=0, le=1)
-    # Used by memory updates (summary/business context), not prompt recent-message injection.
-    conversation_context_message_limit: int = Field(default=8, ge=1, le=20)
-    conversation_context_recent_message_limit: int = Field(default=3, ge=1, le=20)
+    # The prompt contains the durable summary plus this sliding, uncompressed window.
+    conversation_context_message_limit: int = Field(default=10, ge=1, le=20)
+    conversation_context_recent_message_limit: int = Field(default=10, ge=1, le=20)
     conversation_context_char_limit: int = Field(default=6_000, gt=0)
     conversation_memory_summary_limit: int = Field(default=2_000, gt=0)
+    conversation_memory_compact_message_threshold: int = Field(default=20, ge=2)
+    conversation_memory_compact_char_threshold: int = Field(default=12_000, gt=0)
 
     @model_validator(mode="after")
     def validate_retrieval_weights(self) -> "Settings":

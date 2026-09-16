@@ -15,7 +15,7 @@ from requirement_agent.shared.config import get_settings
 from requirement_agent.shared.errors import PermissionDeniedError
 
 
-def get_reviewer(
+def get_reviewer(#用于获取请求头中的 X-Actor-ID，作为当前操作的用户 ID，并检查其角色是否为 reviewer 或 admin。
     actor_id: Annotated[str, Header(alias="X-Actor-ID", min_length=1, max_length=255)],
     actor_role: Annotated[str, Header(alias="X-Actor-Role")] = "reviewer",
 ) -> str:
@@ -24,13 +24,13 @@ def get_reviewer(
     return actor_id
 
 
-def get_actor_id(
+def get_actor_id(#用于获取请求头中的 X-Actor-ID，作为当前操作的用户 ID。
     actor_id: Annotated[str, Header(alias="X-Actor-ID", min_length=1, max_length=255)],
 ) -> str:
     return actor_id
 
 
-def get_ingestion_service(
+def get_ingestion_service(#用于创建 IngestionService 实例，注入数据库 Session、对象存储和任务派发器。
     session: Annotated[AsyncSession, Depends(get_session)],
     storage: Annotated[ObjectStorage, Depends(get_object_storage)],
     dispatcher: Annotated[TaskDispatcher, Depends(get_task_dispatcher)],

@@ -57,8 +57,9 @@ from requirement_agent.application.conversations.context import (
     load_conversation_context,
 )
 from requirement_agent.application.conversations.memory import (
-    update_conversation_memory,
+    should_compact_conversation,
 )
+from requirement_agent.application.ingestion.dispatcher import get_task_dispatcher
 from requirement_agent.infrastructure.database.models import (
     AnalysisResult,
     AuditLog,
@@ -167,11 +168,13 @@ class RequirementAnalysisWorkflow:
         # analyze冲突与风险分析
         # finalize生成待审核任务
         graph = StateGraph(AnalysisState)
+        graph.add_node("load_memory", self._load_memory)
         graph.add_node("extract", self._extract)#创建工作流节点，节点名称为"extract"，对应的处理函数为self._extract。
         graph.add_node("retrieve", self._retrieve)#创建工作流节点，节点名称为"retrieve"，对应的处理函数为self._retrieve。
         graph.add_node("analyze", self._analyze)#创建工作流节点，节点名称为"analyze"，对应的处理函数为self._analyze。
         graph.add_node("finalize", self._finalize)#创建工作流节点，节点名称为"finalize"，对应的处理函数为self._finalize。
-        graph.add_edge(START, "extract")
+        graph.add_edge(START, "load_memory")
+        graph.add_edge("load_memory", "extract")
         graph.add_edge("extract", "retrieve")
         graph.add_edge("retrieve", "analyze")
         graph.add_edge("analyze", "finalize")
@@ -186,23 +189,25 @@ class RequirementAnalysisWorkflow:
             return {"source_record_id": source_record_id}
         #3.合并原始文本、附件解析文本和OCR文本，形成完整的需求内容。
         content = self._source_content(source)
-        #加载会话上下文，获取当前需求所属会话中前面的消息，以及这些消息之前的提取结果和冲突分析结果，拼成一段上下文文本，传给大模型。
-        conversation_context = await load_conversation_context(
-            self._session,
-            source_record_id,
-            message_limit=self._context_recent_message_limit,
-            char_limit=self._context_char_limit,
-        )
-
         #4.执行工作流，运行LangGraph
         result = await self._graph.ainvoke(
             AnalysisState(
                 source_record_id=source_record_id,
                 source_content=content,
-                conversation_context=conversation_context,
             )
         )
         return cast(AnalysisState, result)
+
+    async def _load_memory(self, state: AnalysisState) -> AnalysisState:
+        """Load durable Postgres memory for this run; never reuse LangGraph state."""
+        return {
+            "conversation_context": await load_conversation_context(
+                self._session,
+                state["source_record_id"],
+                message_limit=self._context_recent_message_limit,
+                char_limit=self._context_char_limit,
+            )
+        }
 
     #结构化提取节点，将用户提交的自然语言需求转换为固定格式的数据。
     async def _extract(self, state: AnalysisState) -> AnalysisState:
@@ -290,7 +295,7 @@ class RequirementAnalysisWorkflow:
             )
         except Exception:#检索失败处理
             #可能有如下情况：Embedding模型调用失败；PostgreSQL全文或向量查询失败；数据库连接失败；精确重复查询失败；
-            await self._set_status(source_id, ProcessingStatus.RETRIEVING)#将当前需求的处理状态设置为RETRIEVING，表示正在进行历史需求检索。
+            await self._set_status(source_id, ProcessingStatus.ANALYSIS_FAILED)
             raise
         # 自定义检索器也必须遵守同一条最终混合得分阈值规则。先去重保留
         # 最高分，再筛选、排序、限量，确保低分候选无法进入 conflict_risk Prompt。
@@ -648,14 +653,22 @@ class RequirementAnalysisWorkflow:
         if source is None:
             raise SourceNotFoundError(f"source record {source_id} was not found")
         source.processing_status = ProcessingStatus.PENDING_REVIEW#将当前原始需求的处理状态设置为PENDING_REVIEW，表示已经完成分析，等待人工审核。
-        await update_conversation_memory(
+        # Commit the business result first.  Memory compaction is best-effort and
+        # runs independently so a summary LLM outage can never fail analysis.
+        compact_key = await should_compact_conversation(
             self._session,
             source_id,
-            state["extraction"],
-            message_limit=self._context_message_limit,
-            summary_limit=self._memory_summary_limit,
+            window_size=self._context_recent_message_limit,
+            message_threshold=get_settings().conversation_memory_compact_message_threshold,
+            char_threshold=get_settings().conversation_memory_compact_char_threshold,
         )
         await self._session.commit()#提交事务，将审核任务和原始需求状态的更新保存到数据库。
+        if compact_key:
+            try:
+                get_task_dispatcher().dispatch_conversation_compaction(compact_key)
+            except Exception:
+                # Queue availability must not affect requirement persistence.
+                pass
         return {}
 
     async def _get_source(self, source_record_id: int) -> SourceRecord:

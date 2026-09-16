@@ -126,6 +126,7 @@ async def upload_file(
 
 #查询原始需求列表
 @router.get("/source-records", response_model=SourceRecordListResponse)
+#GET /source-records 接口，用于前端展示“原始需求列表”。
 async def list_source_records(
     session: Annotated[AsyncSession, Depends(get_session)],#注入异步数据库连接。
     page: Annotated[int, Query(ge=1)] = 1,#分页参数
@@ -142,17 +143,17 @@ async def list_source_records(
     if submitter_id is not None:
         filters.append(SourceRecord.submitter_id == submitter_id)
 
-    count_result = await session.execute(
+    count_result = await session.execute(#用于计算符合筛选条件的总记录数。
         select(func.count(SourceRecord.id)).where(*filters)
     )
-    query = (
+    query = (#正式分页查询
         select(SourceRecord)
         .where(*filters)
         .order_by(SourceRecord.received_at.desc(), SourceRecord.id.desc())
         .offset((page - 1) * page_size)
         .limit(page_size)
     )
-    records = (await session.execute(query)).scalars().all()
+    records = (await session.execute(query)).scalars().all()#session.execute()得到的是 SQLAlchemy 查询结果,返回原始需求的基本信息
     return SourceRecordListResponse(
         items=[
             SourceRecordResponse.from_model(record, include_attachments=False)
@@ -164,22 +165,24 @@ async def list_source_records(
     )
 
 
+#查询单条原始需求详情,包括原始文本、处理状态和附件解析结果等。
 @router.get("/source-records/{source_record_id}", response_model=SourceRecordResponse)
 async def get_source_record(
     source_record_id: int,
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> SourceRecordResponse:
-    result = await session.execute(
+    result = await session.execute(##SourceRecord 和 SourceAttachment 是一对多关系：一条原始需求可以上传多个附件。
         select(SourceRecord)
-        .options(selectinload(SourceRecord.attachments))
+        .options(selectinload(SourceRecord.attachments))#selectinload(SourceRecord.attachments) 表示提前把附件一起查出来。
         .where(SourceRecord.id == source_record_id)
     )
     source = result.scalar_one_or_none()
     if source is None:
         raise SourceNotFoundError(f"source record {source_record_id} was not found")
-    return SourceRecordResponse.from_model(source, include_attachments=True)
+    return SourceRecordResponse.from_model(source, include_attachments=True)#直接读取 source.attachments，避免再为附件额外发 SQL 查询
 
-
+#根据文件类型选处理器
+#根据文件的 MIME 类型，返回对应的 Connector 对象（DocumentConnector 或 ImageConnector）。
 def _connector_for(file_type: str) -> DocumentConnector | ImageConnector:
     if file_type in {
         "application/pdf",

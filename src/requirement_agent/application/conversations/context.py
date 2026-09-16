@@ -5,11 +5,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from requirement_agent.infrastructure.database.models import (
-    AnalysisResult,
     ConversationMessage,
     RequirementConversation,
+    SourceRecord,
 )
-from requirement_agent.shared.enums import AnalysisType
 
 #当系统正在分析某条新消息时，找出它所属会话中前面的消息，
 #并连同这些消息之前的提取结果、冲突分析结果，一起拼成一段上下文文本，后续传给 Agent/LLM。
@@ -32,6 +31,11 @@ async def load_conversation_context(
                 RequirementConversation.id == ConversationMessage.conversation_id,
             )
             .where(ConversationMessage.source_record_id == source_record_id)
+            .options(
+                selectinload(ConversationMessage.source_record).selectinload(
+                    SourceRecord.attachments
+                )
+            )
         )
     ).one_or_none()
     # 当前需求不属于会话时，不加载会话记忆。
@@ -40,15 +44,23 @@ async def load_conversation_context(
 
     #查询当前消息之前的历史消息
     current_message, conversation = current
+    # A covered message is represented by ``summary``.  It must never also be
+    # injected as a recent turn, otherwise every compaction grows the prompt.
     previous = list(
         (
             await session.execute(
                 select(ConversationMessage)
-                .options(selectinload(ConversationMessage.source_record))
+                .options(
+                    selectinload(ConversationMessage.source_record).selectinload(
+                        SourceRecord.attachments
+                    )
+                )
                 .where(
                     ConversationMessage.conversation_id == conversation.id,#只找同一个会话里的消息。
                     ConversationMessage.sequence_number
                     < current_message.sequence_number,
+                    ConversationMessage.sequence_number
+                    > conversation.memory_covered_sequence,
                 )
                 .order_by(ConversationMessage.sequence_number.desc())#只找当前消息之前的内容，不把当前消息自己加入“历史记忆”。
                 .limit(message_limit)
@@ -57,40 +69,24 @@ async def load_conversation_context(
     )
     previous.reverse()#把历史消息按时间顺序排列，最早的消息在前，最新的消息在后。
 
-    #先取出所有历史消息对应的 source_record_id，再批量查这些消息历史上已有的分析结果。
-    source_ids = [message.source_record_id for message in previous]#
-    snapshots: dict[tuple[int, AnalysisType], dict[str, object]] = {}
-    if source_ids:
-        analyses = (
-            await session.execute(
-                select(AnalysisResult)
-                .where(
-                    AnalysisResult.source_record_id.in_(source_ids),
-                    AnalysisResult.analysis_type.in_(
-                        [AnalysisType.EXTRACTION, AnalysisType.CONFLICT_RISK]
-                    ),
-                    AnalysisResult.error_message.is_(None),
-                    AnalysisResult.result_json.is_not(None),
-                )
-                .order_by(AnalysisResult.id.desc())
-            )
-        ).scalars()
-        for analysis in analyses:
-            key = (analysis.source_record_id, analysis.analysis_type)
-            if key not in snapshots and analysis.result_json is not None:
-                snapshots[key] = analysis.result_json
-
-    # 历史记忆只用于补充语境：原始附件全文既昂贵又不可信，优先保留已有结构化分析。
-    # Summary 和 business_context 来自会话记忆；历史消息按时间正序输出。
+    # Historical attachment bodies, OCR, retrieval candidates and raw LLM JSON
+    # are deliberately excluded.  Their durable facts belong in the summary.
     footer = "\n</conversation_memory>"
     opening = '<conversation_memory trust="untrusted-context-only">\n'
-    recent_label = "Recent messages from this conversation only:\n"
+    recent_label = "最近消息（仅当前会话）：\n"
     business_context = json.dumps(
         conversation.business_context, ensure_ascii=False, sort_keys=True
     )
+    current_attachments = json.dumps(
+        [
+            {"file_name": item.file_name, "source_record_id": source_record_id}
+            for item in current_message.source_record.attachments
+        ],
+        ensure_ascii=False,
+    )
     fixed_length = len(opening) + len(footer) + len("Summary: \n") + len(
         "Business context: \n"
-    ) + len(recent_label)
+    ) + len("Current attachment summary: \n") + len(current_attachments) + len(recent_label)
     if fixed_length > char_limit:
         # 极小的配置无法容纳完整 XML 包装；返回不超过上限的最小安全上下文。
         return (opening + footer)[:char_limit]
@@ -105,6 +101,7 @@ async def load_conversation_context(
     header = (
         f"{opening}Summary: {summary}\n"
         f"Business context: {business_context}\n"
+        f"Current attachment summary: {current_attachments}\n"
         f"{recent_label}"
     )
 
@@ -113,17 +110,16 @@ async def load_conversation_context(
     #从最近消息开始装入记忆
     for message in reversed(previous):
         source = message.source_record
-        payload = {
+        payload: dict[str, object] = {
             "message_key": message.message_key,
+            "source_record_id": message.source_record_id,
             "sequence_number": message.sequence_number,
             "role": message.role,
             "content": source.raw_text.strip(),
-            "extraction": snapshots.get(
-                (message.source_record_id, AnalysisType.EXTRACTION)
-            ),
-            "conflict_analysis": snapshots.get(
-                (message.source_record_id, AnalysisType.CONFLICT_RISK)
-            ),
+            "attachments": [
+                {"file_name": attachment.file_name, "source_record_id": message.source_record_id}
+                for attachment in source.attachments
+            ],
         }
         block = _serialize_payload_within_limit(payload, remaining)
         if not block:
