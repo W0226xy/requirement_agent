@@ -340,6 +340,28 @@ async def test_approval_requires_reviewer_role(
     assert response.json()["error"]["code"] == "PERMISSION_DENIED"
 
 
+async def test_reject_returns_updated_task_after_commit(
+    review_api_client: tuple[
+        TestClient, RecordingDispatcher, async_sessionmaker[AsyncSession]
+    ],
+) -> None:
+    client, _, session_factory = review_api_client
+
+    rejected = client.post(
+        "/api/v1/review-tasks/1/reject",
+        json={"comment": "不保留该需求"},
+        headers={"X-Actor-ID": "reviewer-1", "X-Actor-Role": "reviewer"},
+    )
+
+    assert rejected.status_code == 200
+    assert rejected.json()["review_status"] == "rejected"
+    assert rejected.json()["review_comment"] == "不保留该需求"
+    async with session_factory() as session:
+        source = await session.get(SourceRecord, 1)
+    assert source is not None
+    assert source.processing_status == ProcessingStatus.REJECTED
+
+
 async def test_list_and_retry_failed_job(
     review_api_client: tuple[
         TestClient, RecordingDispatcher, async_sessionmaker[AsyncSession]

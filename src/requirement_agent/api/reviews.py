@@ -155,9 +155,10 @@ async def reanalyze_review(
     task.review_comment = "reanalyze requested"
     task.reviewed_at = datetime.now(UTC)
     source.processing_status = ProcessingStatus.ANALYZING
+    source_id = source.id
     await session.commit()
-    dispatcher.dispatch_analysis(source.id)
-    return ReviewTaskResponse.model_validate(task)
+    dispatcher.dispatch_analysis(source_id)
+    return await _review_task_response(session, review_task_id)
 
 
 async def _complete_without_version(
@@ -194,7 +195,21 @@ async def _complete_without_version(
             after_data={"status": new_status.value, "comment": comment},
         )
     )
+    # Do not serialize the object that participated in the committed unit of
+    # work.  Its attributes may be expired by a session configuration, which
+    # would cause Pydantic to trigger an implicit async ORM load while building
+    # the HTTP response.
     await session.commit()
+    return await _review_task_response(session, review_task_id)
+
+
+async def _review_task_response(
+    session: AsyncSession, review_task_id: int
+) -> ReviewTaskResponse:
+    """Load a fresh response projection after a review transaction commits."""
+    task = await session.scalar(select(ReviewTask).where(ReviewTask.id == review_task_id))
+    if task is None:
+        raise ReviewTaskNotFoundError(f"review task {review_task_id} was not found")
     return ReviewTaskResponse.model_validate(task)
 
 

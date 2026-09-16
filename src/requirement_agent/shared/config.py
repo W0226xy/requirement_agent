@@ -56,10 +56,10 @@ class Settings(BaseSettings):
     retrieval_min_similarity_score: float = Field(default=0.40, ge=0, le=1)
     # The prompt contains the durable summary plus this sliding, uncompressed window.
     conversation_context_message_limit: int = Field(default=10, ge=1, le=20)
-    conversation_context_recent_message_limit: int = Field(default=10, ge=1, le=20)
+    conversation_context_recent_message_limit: int = Field(default=2, ge=1, le=20)
     conversation_context_char_limit: int = Field(default=6_000, gt=0)
     conversation_memory_summary_limit: int = Field(default=2_000, gt=0)
-    conversation_memory_compact_message_threshold: int = Field(default=20, ge=2)
+    conversation_memory_compact_message_threshold: int = Field(default=4, ge=2)
     conversation_memory_compact_char_threshold: int = Field(default=12_000, gt=0)
 
     @model_validator(mode="after")

@@ -47,6 +47,7 @@ import type {
   ReviewTask,
   SourceRecord,
 } from "../types";
+import { applyReviewTaskUpdate } from "./conversationReviewUpdate";
 
 type Draft = {
   task: ReviewTask;
@@ -133,7 +134,7 @@ export function ConversationPage() {
   );
 
   const loadConversationList = useCallback(
-    async (showLoading = false) => {
+    async (showLoading = false, reportError = true): Promise<boolean> => {
       const generation = ++listRequestGeneration.current;
       if (showLoading) setLoadingConversations(true);
       try {
@@ -142,11 +143,13 @@ export function ConversationPage() {
           {},
           session,
         );
-        if (generation !== listRequestGeneration.current) return;
+        if (generation !== listRequestGeneration.current) return false;
         setConversations(sortConversations(page.items));
         setError(null);
+        return true;
       } catch (caught) {
-        if (generation === listRequestGeneration.current) setError(caught);
+        if (reportError && generation === listRequestGeneration.current) setError(caught);
+        return false;
       } finally {
         if (generation === listRequestGeneration.current) {
           setLoadingConversations(false);
@@ -157,7 +160,7 @@ export function ConversationPage() {
   );
 
   const loadMessages = useCallback(
-    async (key: string, showLoading = false) => {
+    async (key: string, showLoading = false, reportError = true): Promise<boolean> => {
       const generation = ++messageRequestGeneration.current;
       if (showLoading) setLoadingMessages(true);
       try {
@@ -170,17 +173,20 @@ export function ConversationPage() {
           generation !== messageRequestGeneration.current ||
           activeKeyRef.current !== key
         ) {
-          return;
+          return false;
         }
         setMessages(page.items);
         setError(null);
+        return true;
       } catch (caught) {
         if (
+          reportError &&
           generation === messageRequestGeneration.current &&
           activeKeyRef.current === key
         ) {
           setError(caught);
         }
+        return false;
       } finally {
         if (
           generation === messageRequestGeneration.current &&
@@ -444,21 +450,26 @@ export function ConversationPage() {
       setDraft(null);
       void message.success("需求已保留并生成正式版本");
       if (conversationKey) {
-        await Promise.all([
-          loadMessages(conversationKey),
-          loadConversationList(),
+        const refreshed = await Promise.all([
+          loadMessages(conversationKey, false, false),
+          loadConversationList(false, false),
         ]);
+        if (refreshed.includes(false)) {
+          void message.warning("审核已提交，但刷新最新数据失败；请稍后重试刷新。");
+        }
       }
     } catch (caught) {
       setError(caught);
+      void message.error("审核请求失败，需求状态未确认更新。");
     } finally {
       setSubmitting(false);
     }
   }
 
   async function reject(task: ReviewTask) {
+    setSubmitting(true);
     try {
-      await api(
+      const updatedReview = await api<ReviewTask>(
         `/api/v1/review-tasks/${task.id}/reject`,
         {
           method: "POST",
@@ -468,15 +479,22 @@ export function ConversationPage() {
         },
         session,
       );
+      setMessages((current) => applyReviewTaskUpdate(current, updatedReview));
       void message.success("该需求已标记为不保留");
       if (conversationKey) {
-        await Promise.all([
-          loadMessages(conversationKey),
-          loadConversationList(),
+        const refreshed = await Promise.all([
+          loadMessages(conversationKey, false, false),
+          loadConversationList(false, false),
         ]);
+        if (refreshed.includes(false)) {
+          void message.warning("审核已提交，但刷新最新数据失败；请稍后重试刷新。");
+        }
       }
     } catch (caught) {
       setError(caught);
+      void message.error("审核请求失败，需求状态未确认更新。");
+    } finally {
+      setSubmitting(false);
     }
   }
 

@@ -12,13 +12,11 @@ from requirement_agent.ai.llm.factory import get_embedding_model, get_llm
 from requirement_agent.ai.retrieval.hybrid import RetrievalWeights
 from requirement_agent.application.ingestion.dispatcher import (
     ANALYZE_SOURCE_TASK,
-    COMPACT_CONVERSATION_TASK,
     FEISHU_EVENT_TASK,
     INDEX_VERSION_TASK,
     PARSE_SOURCE_TASK,
     get_task_dispatcher,
 )
-from requirement_agent.application.conversations.memory import compact_conversation
 from requirement_agent.application.ingestion.service import IngestionService
 from requirement_agent.application.versions.indexing import index_requirement_version
 from requirement_agent.connectors.feishu import (
@@ -228,11 +226,6 @@ def register_tasks(celery_app: Celery) -> None:#注册 Celery 任务
     def index_version_task(version_id: int) -> None:#正式需求向量化任务
         run_worker_coroutine(index_version(version_id))
 
-    def compact_conversation_task(conversation_key: str) -> None:
-        # Intentionally no autoretry: the next completed turn can request a new
-        # compaction, and this task must remain best-effort.
-        run_worker_coroutine(compact_conversation_memory(conversation_key))
-
     def process_feishu_event_task(payload: dict[str, object]) -> None:#飞书事件处理任务
         run_worker_coroutine(process_feishu_event(payload))
 
@@ -244,7 +237,6 @@ def register_tasks(celery_app: Celery) -> None:#注册 Celery 任务
         retry_kwargs={"max_retries": 3},
     )(parse_source_task)
     celery_app.task(name=ANALYZE_SOURCE_TASK)(analyze_source_task)
-    celery_app.task(name=COMPACT_CONVERSATION_TASK)(compact_conversation_task)
     celery_app.task(
         name=INDEX_VERSION_TASK,
         autoretry_for=(LLMServiceError, SQLAlchemyError),
@@ -280,19 +272,6 @@ async def analyze_source(source_record_id: int) -> None:
         )
         await workflow.run(source_record_id)#运行工作流，分析指定的原始需求记录 ID。工作流内部会调用 LLM、检索数据库、生成结构化结果，并写入数据库。
 
-
-async def compact_conversation_memory(conversation_key: str) -> bool:
-    settings = get_settings()
-    try:
-        return await compact_conversation(
-            conversation_key, get_session_factory(), get_llm(),
-            window_size=settings.conversation_context_recent_message_limit,
-            summary_limit=settings.conversation_memory_summary_limit,
-        )
-    except Exception:
-        # A failed summary is safe to retry on a later message and never changes
-        # the already committed analysis flow.
-        return False
 
 #把一条已经审核通过的正式需求版本加入长期 RAG 知识库
 async def index_version(version_id: int) -> None:#参数 version_id 是人工审核后提交形成的正式需求版本的 ID
