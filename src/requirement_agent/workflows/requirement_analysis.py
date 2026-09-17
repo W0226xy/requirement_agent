@@ -67,8 +67,10 @@ from requirement_agent.application.ingestion.dispatcher import (
 from requirement_agent.infrastructure.database.models import (
     AnalysisResult,
     AuditLog,
+    ConversationMessage,
     FeatureLineage,
     Requirement,
+    RequirementConversation,
     RequirementVersion,
     ReviewTask,
     SourceRecord,
@@ -205,14 +207,15 @@ class RequirementAnalysisWorkflow:
         )
         return cast(AnalysisState, result)
 
+    #在分析当前需求前，从 PostgreSQL 恢复该会话此前的有效上下文，并放入本次工作流状态。
     async def _load_memory(self, state: AnalysisState) -> AnalysisState:
         """Load durable Postgres memory for this run; never reuse LangGraph state."""
         return {
             "conversation_context": await load_conversation_context(
-                self._session,
-                state["source_record_id"],
-                message_limit=self._context_recent_message_limit,
-                char_limit=self._context_char_limit,
+                self._session,#当前数据库会话，用于从 PostgreSQL 查询会话、消息和摘要
+                state["source_record_id"],#当前正在分析的原始需求 ID
+                message_limit=self._context_recent_message_limit,#最多取多少条历史消息，例如最近 5 条。
+                char_limit=self._context_char_limit,#最终拼出的记忆文本最大字符数
             )
         }
 
@@ -660,6 +663,10 @@ class RequirementAnalysisWorkflow:
         if source is None:
             raise SourceNotFoundError(f"source record {source_id} was not found")
         source.processing_status = ProcessingStatus.PENDING_REVIEW#将当前原始需求的处理状态设置为PENDING_REVIEW，表示已经完成分析，等待人工审核。
+        await self._update_conversation_business_context(
+            source_id,
+            RequirementExtraction.model_validate(state["extraction"]),
+        )
         # Commit the business result first.  Memory compaction is best-effort and
         # runs independently so a summary LLM outage can never fail analysis.
         compact_key = await should_compact_conversation(
@@ -683,6 +690,92 @@ class RequirementAnalysisWorkflow:
                     COMPACT_CONVERSATION_TASK,
                 )
         return {}
+
+    async def _update_conversation_business_context(
+        self,
+        source_record_id: int,
+        extraction: RequirementExtraction,
+    ) -> None:
+        """Merge successful extraction facts into its conversation, if any.
+
+        Locking the conversation makes the read-modify-write safe when several
+        messages in the same conversation finish analysis at nearly the same time.
+        """
+        conversation = (
+            await self._session.execute(
+                select(RequirementConversation)
+                .execution_options(populate_existing=True)
+                .join(
+                    ConversationMessage,
+                    ConversationMessage.conversation_id == RequirementConversation.id,
+                )
+                .where(
+                    ConversationMessage.source_record_id == source_record_id,
+                    RequirementConversation.deleted_at.is_(None),
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if conversation is None:
+            return
+
+        modules = self._nonempty_strings(extraction.functional_modules)
+        entities = extraction.entities
+        scalar_entities = {
+            key: value.strip()
+            for key, value in {
+                "platform": entities.platform,
+                "page": entities.page,
+                "target": entities.target,
+            }.items()
+            if isinstance(value, str) and value.strip()
+        }
+        actors = self._nonempty_strings(entities.actors)
+        if not modules and not scalar_entities and not actors:
+            return
+
+        old_context = (
+            dict(conversation.business_context)
+            if isinstance(conversation.business_context, dict)
+            else {}
+        )
+        old_entities = old_context.get("entities")
+        merged_entities = dict(old_entities) if isinstance(old_entities, dict) else {}
+
+        if modules:
+            old_context["modules"] = self._merge_strings(
+                old_context.get("modules"), modules
+            )
+        if scalar_entities:
+            merged_entities.update(scalar_entities)
+        if actors:
+            merged_entities["actors"] = self._merge_strings(
+                merged_entities.get("actors"), actors
+            )
+        if scalar_entities or actors:
+            old_context["entities"] = merged_entities
+        conversation.business_context = old_context
+
+    @staticmethod
+    def _nonempty_strings(value: object) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return RequirementAnalysisWorkflow._merge_strings([], value)
+
+    @staticmethod
+    def _merge_strings(existing: object, incoming: object) -> list[str]:
+        values = existing if isinstance(existing, list) else []
+        additions = incoming if isinstance(incoming, list) else []
+        merged: list[str] = []
+        seen: set[str] = set()
+        for value in [*values, *additions]:
+            if not isinstance(value, str):
+                continue
+            normalized = value.strip()
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                merged.append(normalized)
+        return merged
 
     async def _get_source(self, source_record_id: int) -> SourceRecord:
         #根据原始需求ID，从数据库中查询对应的 SourceRecord，并同时加载它关联的附件；如果不存在就抛出业务异常。

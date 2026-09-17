@@ -10,6 +10,7 @@ from sqlalchemy.pool import StaticPool
 
 from requirement_agent.ai.llm.fake import FakeLLM
 from requirement_agent.ai.retrieval.hybrid import RetrievalWeights
+from requirement_agent.ai.schemas.analysis import RequirementEntities, RequirementExtraction
 from requirement_agent.ai.schemas.retrieval import RequirementCandidate
 from requirement_agent.infrastructure.database.base import Base
 from requirement_agent.infrastructure.database.models import (
@@ -32,7 +33,11 @@ from requirement_agent.shared.enums import (
     RequirementChangeType,
     RequirementStatus,
 )
-from requirement_agent.shared.errors import CandidateScopeError, LLMServiceError
+from requirement_agent.shared.errors import (
+    CandidateScopeError,
+    LLMServiceError,
+    StructuredOutputError,
+)
 from requirement_agent.workflows.requirement_analysis import RequirementAnalysisWorkflow
 
 
@@ -163,6 +168,32 @@ def insufficient_info_conflict() -> dict[str, object]:
     }
 
 
+async def associate_source_with_conversation(
+    session: AsyncSession,
+    *,
+    source_record_id: int,
+    business_context: object = None,
+) -> RequirementConversation:
+    conversation = RequirementConversation(
+        conversation_key=f"CONV-BUSINESS-{source_record_id}",
+        owner_id="user-1",
+        title="Business context",
+        business_context=business_context if isinstance(business_context, dict) else {},
+    )
+    session.add(conversation)
+    await session.flush()
+    session.add(
+        ConversationMessage(
+            message_key=f"MSG-BUSINESS-{source_record_id}",
+            conversation_id=conversation.id,
+            source_record_id=source_record_id,
+            sequence_number=1,
+        )
+    )
+    await session.commit()
+    return conversation
+
+
 async def add_compaction_candidate(
     session: AsyncSession,
 ) -> RequirementConversation:
@@ -245,6 +276,158 @@ async def test_workflow_reaches_pending_review(
     assert len(records) == 2
     assert len(review_tasks) == 1
     assert review_tasks[0].analysis_snapshot["conflict_status"] == "duplicate"
+    assert (
+        await workflow_session.scalar(select(RequirementConversation.id).limit(1))
+    ) is None
+
+
+async def test_successful_analysis_writes_conversation_business_context(
+    workflow_session: AsyncSession,
+) -> None:
+    conversation = await associate_source_with_conversation(workflow_session, source_record_id=1)
+    workflow = RequirementAnalysisWorkflow(
+        workflow_session,
+        FakeLLM([extraction(), conflict()], model_name="fake-chat"),
+        FakeLLM([], model_name="fake-embedding"),
+        max_retries=2,
+        retrieval_weights=RetrievalWeights(keyword=0.4, vector=0.4, business=0.2),
+        candidate_limit=20,
+        retriever=FakeRetriever([candidate()]),
+    )
+
+    await workflow.run(1)
+
+    refreshed = await workflow_session.get(RequirementConversation, conversation.id)
+    assert refreshed is not None
+    assert refreshed.business_context == {
+        "modules": ["reporting"],
+        "entities": {
+            "platform": "web",
+            "page": "reports",
+            "target": "report",
+            "actors": ["analyst"],
+        },
+    }
+
+
+async def test_conversation_business_context_merges_later_analysis(
+    workflow_session: AsyncSession,
+) -> None:
+    conversation = await associate_source_with_conversation(
+        workflow_session,
+        source_record_id=1,
+        business_context={
+            "modules": ["reporting"],
+            "entities": {
+                "platform": "web",
+                "page": "old reports",
+                "target": "old report",
+                "actors": ["analyst"],
+            },
+        },
+    )
+    workflow_session.add(
+        SourceRecord(
+            id=2,
+            source_key="SRC-BUSINESS-SECOND",
+            channel_type=ChannelType.WEB_FORM,
+            external_event_id="business-second-event",
+            submitter_id="user-1",
+            submitter_name="Tester",
+            raw_text="Add scheduled exports.",
+            raw_metadata={"input_surface": "conversation"},
+            received_at=datetime.now(UTC),
+            processing_status=ProcessingStatus.PARSING,
+        )
+    )
+    await workflow_session.flush()
+    workflow_session.add(
+        ConversationMessage(
+            message_key="MSG-BUSINESS-SECOND",
+            conversation_id=conversation.id,
+            source_record_id=2,
+            sequence_number=2,
+        )
+    )
+    await workflow_session.commit()
+    later_extraction = extraction() | {
+        "functional_modules": ["reporting", "scheduling"],
+        "entities": {
+            "platform": "web",
+            "page": "scheduled reports",
+            "target": "schedule",
+            "actors": ["analyst", "administrator"],
+        },
+    }
+    workflow = RequirementAnalysisWorkflow(
+        workflow_session,
+        FakeLLM([later_extraction, conflict()], model_name="fake-chat"),
+        FakeLLM([], model_name="fake-embedding"),
+        max_retries=2,
+        retrieval_weights=RetrievalWeights(keyword=0.4, vector=0.4, business=0.2),
+        candidate_limit=20,
+        retriever=FakeRetriever([candidate()]),
+    )
+
+    await workflow.run(2)
+
+    refreshed = await workflow_session.get(RequirementConversation, conversation.id)
+    assert refreshed is not None
+    assert refreshed.business_context == {
+        "modules": ["reporting", "scheduling"],
+        "entities": {
+            "platform": "web",
+            "page": "scheduled reports",
+            "target": "schedule",
+            "actors": ["analyst", "administrator"],
+        },
+    }
+
+
+async def test_failed_or_empty_extraction_does_not_overwrite_business_context(
+    workflow_session: AsyncSession,
+) -> None:
+    conversation = await associate_source_with_conversation(
+        workflow_session,
+        source_record_id=1,
+        business_context={
+            "modules": ["reporting"],
+            "entities": {"page": "reports", "actors": ["analyst"]},
+        },
+    )
+    workflow = RequirementAnalysisWorkflow(
+        workflow_session,
+        FakeLLM([{}, {}], model_name="fake-chat"),
+        FakeLLM([], model_name="fake-embedding"),
+        max_retries=1,
+        retrieval_weights=RetrievalWeights(keyword=0.4, vector=0.4, business=0.2),
+        candidate_limit=20,
+        retriever=FakeRetriever([candidate()]),
+    )
+
+    with pytest.raises(StructuredOutputError):
+        await workflow.run(1)
+
+    refreshed = await workflow_session.get(RequirementConversation, conversation.id)
+    assert refreshed is not None
+    assert refreshed.business_context == {
+        "modules": ["reporting"],
+        "entities": {"page": "reports", "actors": ["analyst"]},
+    }
+
+    empty_extraction = RequirementExtraction.model_construct(
+        functional_modules=[],
+        entities=RequirementEntities.model_construct(
+            platform=None, page=None, target=None, actors=[]
+        ),
+    )
+    await workflow._update_conversation_business_context(1, empty_extraction)
+    await workflow_session.commit()
+    await workflow_session.refresh(refreshed)
+    assert refreshed.business_context == {
+        "modules": ["reporting"],
+        "entities": {"page": "reports", "actors": ["analyst"]},
+    }
 
 
 async def test_workflow_dispatches_compaction_after_threshold(

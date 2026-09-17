@@ -202,6 +202,7 @@ async def test_clear_context_keeps_messages_and_sources(
     assert posted.status_code == 202
     assert cleared.status_code == 200
     assert cleared.json()["summary"] == ""
+    assert cleared.json()["business_context"] == {}
     assert cleared.json()["memory_covered_sequence"] == 1
     assert messages.json()["total"] == 1
     assert messages.json()["items"][0]["source"]["raw_text"] == "仍需保留的原始需求"

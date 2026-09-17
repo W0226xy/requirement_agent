@@ -12,7 +12,7 @@ PARSE_SOURCE_TASK = "requirement_agent.sources.parse"#解析原始需求附件
 ANALYZE_SOURCE_TASK = "requirement_agent.sources.analyze"#对需求执行 AI 分析
 INDEX_VERSION_TASK = "requirement_agent.requirements.index_version"#审核通过后建立 RAG 向量索引
 FEISHU_EVENT_TASK = "requirement_agent.connectors.feishu.process_event"#异步处理飞书事件
-COMPACT_CONVERSATION_TASK = "requirement_agent.conversations.compact"
+COMPACT_CONVERSATION_TASK = "requirement_agent.conversations.compact"#压缩会话上下文
 #任务链路：
 #用户上传 PDF / Word / 图片
 # → PARSE_SOURCE_TASK
@@ -34,7 +34,7 @@ class TaskDispatcher(Protocol):#任务分发抽象接口
     def dispatch_version(self, version_id: int) -> None:#投递建立 RAG 向量索引任务。
         ...
 
-    def dispatch_conversation_compaction(self, conversation_key: str) -> None:
+    def dispatch_conversation_compaction(self, conversation_key: str) -> None:#投递会话压缩任务。
         ...
 
 
@@ -62,7 +62,7 @@ class CeleryTaskDispatcher:# Celery 任务分发器实现
     def dispatch_version(self, version_id: int) -> None:
         self._celery_app.send_task(INDEX_VERSION_TASK, args=[version_id])
 
-    def dispatch_conversation_compaction(self, conversation_key: str) -> None:
+    def dispatch_conversation_compaction(self, conversation_key: str) -> None:#投递会话压缩任务
         self._celery_app.send_task(COMPACT_CONVERSATION_TASK, args=[conversation_key])
 
     #投递飞书事件
@@ -72,5 +72,5 @@ class CeleryTaskDispatcher:# Celery 任务分发器实现
 
 
 @lru_cache
-def get_task_dispatcher() -> CeleryTaskDispatcher:
+def get_task_dispatcher() -> CeleryTaskDispatcher:#返回 CeleryTaskDispatcher 实例，使用 lru_cache 缓存，避免重复创建 Celery 应用。
     return CeleryTaskDispatcher(create_celery_app())
