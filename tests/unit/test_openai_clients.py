@@ -68,6 +68,34 @@ async def test_chat_and_embedding_use_independent_services_and_keys() -> None:
     assert json.loads(requests[1].content)["model"] == "embedding-model"
 
 
+async def test_conversation_summary_does_not_request_json_object_mode() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "已确认需求：提醒功能"}}]},
+        )
+
+    chat = OpenAICompatibleChatModel(
+        base_url="https://chat.example/v1",
+        api_key="chat-secret",
+        model="chat-model",
+        timeout_seconds=10,
+        max_tokens=4096,
+        transport=httpx.MockTransport(handler),
+    )
+
+    summary = await chat.complete(
+        [{"role": "user", "content": "请生成会话摘要"}],
+        analysis_type="conversation_summary",
+    )
+
+    assert summary == "已确认需求：提醒功能"
+    assert "response_format" not in json.loads(requests[0].content)
+
+
 async def test_embedding_rejects_wrong_dimension() -> None:
     transport = httpx.MockTransport(
         lambda request: httpx.Response(

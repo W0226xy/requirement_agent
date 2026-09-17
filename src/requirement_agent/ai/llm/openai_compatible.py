@@ -52,10 +52,17 @@ class _OpenAICompatibleClient:
                 if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None
                 else None
             )
+            response_body = (
+                exc.response.text[:1_000]
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None
+                else None
+            )
             logger.warning(
-                "model_service_request_failed http_status=%s error_type=%s",
+                "model_service_request_failed http_status=%s error_type=%s "
+                "response_body=%r",
                 status_code,
                 type(exc).__name__,
+                response_body,
             )
             raise LLMServiceError(
                 f"model service request failed: {type(exc).__name__}"
@@ -99,10 +106,14 @@ class OpenAICompatibleChatModel(_OpenAICompatibleClient):
         payload: dict[str, object] = {
             "model": self._model,
             "messages": messages,
-            "response_format": {"type": "json_object"},
             "temperature": 0,
             "max_tokens": self._max_tokens,
         }
+        # Conversation summaries are deliberately plain, headed text rather than a
+        # JSON document.  Some OpenAI-compatible providers reject json_object mode
+        # when the prompt does not ask for JSON.
+        if analysis_type != "conversation_summary":
+            payload["response_format"] = {"type": "json_object"}
         response, status_code = await self._post("/chat/completions", payload)
         try:
             choices = response["choices"]

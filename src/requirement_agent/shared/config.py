@@ -54,12 +54,16 @@ class Settings(BaseSettings):
     retrieval_business_weight: float = Field(default=0.2, ge=0, le=1)
     retrieval_candidate_limit: int = Field(default=20, ge=10, le=20)
     retrieval_min_similarity_score: float = Field(default=0.40, ge=0, le=1)
+
     # The prompt contains the durable summary plus this sliding, uncompressed window.
     conversation_context_message_limit: int = Field(default=10, ge=1, le=20)
-    conversation_context_recent_message_limit: int = Field(default=2, ge=1, le=20)
-    conversation_context_char_limit: int = Field(default=6_000, gt=0)
-    conversation_memory_summary_limit: int = Field(default=2_000, gt=0)
+    conversation_context_recent_message_limit: int = Field(default=2, ge=1, le=20)#每次分析新消息时，除摘要外，还会保留最近 2 条未压缩原文消息。
+    conversation_context_char_limit: int = Field(default=6_000, gt=0)#拼给模型的会话记忆总长度最多 6000 字符，避免 Prompt 无限增长。
+    conversation_memory_summary_limit: int = Field(default=2_000, gt=0)#摘要最多 2000 字符。
+    #满足以下任一条件时，会尝试触发摘要压缩：
+    #1.同一会话消息总数达到 4 条；
     conversation_memory_compact_message_threshold: int = Field(default=4, ge=2)
+    #2.同一会话消息总长度达到 12000 字符。
     conversation_memory_compact_char_threshold: int = Field(default=12_000, gt=0)
 
     @model_validator(mode="after")

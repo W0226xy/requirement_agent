@@ -1,4 +1,5 @@
 import json
+import logging
 from functools import partial
 from typing import Protocol, TypedDict, cast
 
@@ -59,7 +60,10 @@ from requirement_agent.application.conversations.context import (
 from requirement_agent.application.conversations.memory import (
     should_compact_conversation,
 )
-from requirement_agent.application.ingestion.dispatcher import get_task_dispatcher
+from requirement_agent.application.ingestion.dispatcher import (
+    COMPACT_CONVERSATION_TASK,
+    get_task_dispatcher,
+)
 from requirement_agent.infrastructure.database.models import (
     AnalysisResult,
     AuditLog,
@@ -84,6 +88,9 @@ from requirement_agent.shared.errors import (
     SourceNotFoundError,
     StructuredOutputError,
 )
+
+
+logger = logging.getLogger(__name__)
 
 #是节点之间传递的数据容器，保存当前来源记录 ID、合并后的文本、提取结果、
 #候选历史需求、冲突分析结果、已有模块和会话上下文
@@ -668,7 +675,13 @@ class RequirementAnalysisWorkflow:
                 get_task_dispatcher().dispatch_conversation_compaction(compact_key)
             except Exception:
                 # Queue availability must not affect requirement persistence.
-                pass
+                logger.exception(
+                    "Conversation compaction dispatch failed: "
+                    "source_record_id=%s conversation_key=%s task_name=%s",
+                    source_id,
+                    compact_key,
+                    COMPACT_CONVERSATION_TASK,
+                )
         return {}
 
     async def _get_source(self, source_record_id: int) -> SourceRecord:

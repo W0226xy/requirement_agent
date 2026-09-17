@@ -17,6 +17,7 @@ import {
   Input,
   List,
   message,
+  Modal,
   Radio,
   Row,
   Select,
@@ -46,6 +47,8 @@ import {
   changeOperationOptions,
   newOperationFormValue,
   proposedOperationsToFormValues,
+  recalculateSuggestedDraft,
+  type DraftField,
   type OperationFormValue,
 } from "./reviewOperationForm";
 
@@ -78,7 +81,10 @@ export function ReviewDetailPage() {
         setSource(rawSource);
         setRequirements(requirementPage.items);
         setTitle(String(review.extraction_snapshot.requirement_summary ?? ""));
-        setOperationForms(proposedOperationsToFormValues(review.analysis_snapshot.proposed_operations));
+        setOperationForms(proposedOperationsToFormValues(
+          review.analysis_snapshot.proposed_operations,
+          review.extraction_snapshot,
+        ));
       })
       .catch(setError);
   }, [id]);
@@ -141,13 +147,53 @@ export function ReviewDetailPage() {
     }
   }
 
-  function updateOperation(id: string, patch: Partial<OperationFormValue>) {
-    setOperationForms((current) => current.map((item) => item.id === id ? { ...item, ...patch } : item));
+  function updateOperation(
+    id: string,
+    patch: Partial<OperationFormValue>,
+    dirtyFields: DraftField[] = [],
+  ) {
+    setOperationForms((current) => current.map((item) => item.id === id ? {
+      ...item, ...patch,
+      dirty: dirtyFields.length ? {
+        ...item.dirty,
+        ...Object.fromEntries(dirtyFields.map((field) => [field, true])),
+      } : item.dirty,
+    } : item));
     setOperationErrors((current) => {
       const next = { ...current };
       for (const key of Object.keys(patch)) delete next[`${id}.${key}`];
       return next;
     });
+  }
+
+  function changeOperation(item: OperationFormValue, operation: OperationFormValue["operation"]) {
+    const featureKey = operation === "add" ? null : item.featureKey;
+    const features = decision === "merge" ? targetRequirement?.features ?? [] : [];
+    updateOperation(
+      item.id,
+      recalculateSuggestedDraft(
+        { ...item, operation, featureKey }, features, task?.extraction_snapshot ?? {},
+      ),
+    );
+  }
+
+  function refillFromSuggestion(item: OperationFormValue) {
+    const features = decision === "merge" ? targetRequirement?.features ?? [] : [];
+    const refill = () => updateOperation(
+      item.id,
+      recalculateSuggestedDraft(item, features, task?.extraction_snapshot ?? {}, true),
+    );
+    if (Object.values(item.dirty).some(Boolean)) {
+      Modal.confirm({
+        title: "按 AI 建议重新填充？",
+        content: "这会覆盖当前手动编辑的功能模块、标题、描述和验收标准。",
+        okText: "覆盖并重新填充",
+        cancelText: "取消",
+        onOk: refill,
+      });
+      return;
+    }
+    refill();
   }
 
   async function action(name: "reject" | "return" | "reanalyze") {
@@ -337,14 +383,15 @@ export function ReviewDetailPage() {
               >
                 <Form layout="vertical">
                   <Row gutter={12}>
-                    <Col xs={24} md={8}><Form.Item label="变更类型"><Select disabled={!pending} value={item.operation} options={changeOperationOptions} onChange={(operation) => updateOperation(item.id, { operation, featureKey: operation === "add" ? null : item.featureKey })} /></Form.Item></Col>
-                    {needsTarget && <Col xs={24} md={16}><Form.Item label="目标功能" validateStatus={operationErrors[`${item.id}.featureKey`] ? "error" : undefined} help={operationErrors[`${item.id}.featureKey`]}><Select disabled={!pending || decision !== "merge" || !targetRequirement} value={item.featureKey ?? undefined} placeholder={decision === "merge" ? "请选择已有功能" : "创建新需求时不能修改或删除已有功能"} options={selectableFeatures.map((feature) => ({ value: feature.feature_key, label: `${feature.feature_key} · ${feature.feature_title}` }))} onChange={(featureKey) => updateOperation(item.id, applyTargetFeature(item, featureKey, selectableFeatures))} /></Form.Item></Col>}
+                    <Col xs={24} md={8}><Form.Item label="变更类型"><Select disabled={!pending} value={item.operation} options={changeOperationOptions} onChange={(operation) => changeOperation(item, operation)} /></Form.Item></Col>
+                    {needsTarget && <Col xs={24} md={16}><Form.Item label="目标功能" validateStatus={operationErrors[`${item.id}.featureKey`] ? "error" : undefined} help={operationErrors[`${item.id}.featureKey`]}><Select disabled={!pending || decision !== "merge" || !targetRequirement} value={item.featureKey ?? undefined} placeholder={decision === "merge" ? "请选择已有功能" : "创建新需求时不能修改或删除已有功能"} options={selectableFeatures.map((feature) => ({ value: feature.feature_key, label: `${feature.feature_key} · ${feature.feature_title}` }))} onChange={(featureKey) => updateOperation(item.id, applyTargetFeature(item, featureKey, selectableFeatures, task.extraction_snapshot))} /></Form.Item></Col>}
                   </Row>
                   {hasContent && <>
-                    <Form.Item label="功能模块" validateStatus={operationErrors[`${item.id}.module`] ? "error" : undefined} help={operationErrors[`${item.id}.module`]}><Input disabled={!pending} value={item.module} onChange={(event) => updateOperation(item.id, { module: event.target.value })} /></Form.Item>
-                    <Form.Item label="功能标题" validateStatus={operationErrors[`${item.id}.featureTitle`] ? "error" : undefined} help={operationErrors[`${item.id}.featureTitle`]}><Input disabled={!pending} value={item.featureTitle} onChange={(event) => updateOperation(item.id, { featureTitle: event.target.value })} /></Form.Item>
-                    <Form.Item label="功能描述" validateStatus={operationErrors[`${item.id}.featureDescription`] ? "error" : undefined} help={operationErrors[`${item.id}.featureDescription`]}><Input.TextArea disabled={!pending} value={item.featureDescription} autoSize={{ minRows: 2 }} onChange={(event) => updateOperation(item.id, { featureDescription: event.target.value })} /></Form.Item>
-                    <Form.Item label="验收标准"><Space direction="vertical" className="acceptance-list">{item.acceptanceCriteria.map((criterion, criterionIndex) => <Space key={criterionIndex}><Input disabled={!pending} value={criterion} onChange={(event) => updateOperation(item.id, { acceptanceCriteria: item.acceptanceCriteria.map((value, valueIndex) => valueIndex === criterionIndex ? event.target.value : value) })} /><Button disabled={!pending} danger icon={<DeleteOutlined />} onClick={() => updateOperation(item.id, { acceptanceCriteria: item.acceptanceCriteria.filter((_, valueIndex) => valueIndex !== criterionIndex) })} /></Space>)}<Button disabled={!pending} icon={<PlusOutlined />} onClick={() => updateOperation(item.id, { acceptanceCriteria: [...item.acceptanceCriteria, ""] })}>新增验收标准</Button></Space></Form.Item>
+                    <Button disabled={!pending} size="small" onClick={() => refillFromSuggestion(item)}>按 AI 建议重新填充</Button>
+                    <Form.Item label="功能模块" validateStatus={operationErrors[`${item.id}.module`] ? "error" : undefined} help={operationErrors[`${item.id}.module`]}><Input disabled={!pending} value={item.module} onChange={(event) => updateOperation(item.id, { module: event.target.value }, ["module"])} /></Form.Item>
+                    <Form.Item label="功能标题" validateStatus={operationErrors[`${item.id}.featureTitle`] ? "error" : undefined} help={operationErrors[`${item.id}.featureTitle`]}><Input disabled={!pending} value={item.featureTitle} onChange={(event) => updateOperation(item.id, { featureTitle: event.target.value }, ["featureTitle"])} /></Form.Item>
+                    <Form.Item label="功能描述" validateStatus={operationErrors[`${item.id}.featureDescription`] ? "error" : undefined} help={operationErrors[`${item.id}.featureDescription`]}><Input.TextArea disabled={!pending} value={item.featureDescription} autoSize={{ minRows: 2 }} onChange={(event) => updateOperation(item.id, { featureDescription: event.target.value }, ["featureDescription"])} /></Form.Item>
+                    <Form.Item label="验收标准"><Space direction="vertical" className="acceptance-list">{item.acceptanceCriteria.map((criterion, criterionIndex) => <Space key={criterionIndex}><Input disabled={!pending} value={criterion} onChange={(event) => updateOperation(item.id, { acceptanceCriteria: item.acceptanceCriteria.map((value, valueIndex) => valueIndex === criterionIndex ? event.target.value : value) }, ["acceptanceCriteria"])} /><Button disabled={!pending} danger icon={<DeleteOutlined />} onClick={() => updateOperation(item.id, { acceptanceCriteria: item.acceptanceCriteria.filter((_, valueIndex) => valueIndex !== criterionIndex) }, ["acceptanceCriteria"])} /></Space>)}<Button disabled={!pending} icon={<PlusOutlined />} onClick={() => updateOperation(item.id, { acceptanceCriteria: [...item.acceptanceCriteria, ""] }, ["acceptanceCriteria"])}>新增验收标准</Button></Space></Form.Item>
                   </>}
                   <Form.Item label="变更原因" validateStatus={operationErrors[`${item.id}.reason`] ? "error" : undefined} help={operationErrors[`${item.id}.reason`]}><Input.TextArea disabled={!pending} value={item.reason} autoSize={{ minRows: 2 }} onChange={(event) => updateOperation(item.id, { reason: event.target.value })} /></Form.Item>
                 </Form>
@@ -352,7 +399,7 @@ export function ReviewDetailPage() {
             );
           })}
         </Space>
-        {pending && <Button icon={<PlusOutlined />} onClick={() => setOperationForms((current) => [...current, newOperationFormValue()])}>新增变更项</Button>}
+        {pending && <Button icon={<PlusOutlined />} onClick={() => setOperationForms((current) => [...current, newOperationFormValue(task.extraction_snapshot)])}>新增变更项</Button>}
         <Collapse items={[{ key: "final-json", label: "查看最终 JSON（高级/调试）", children: <Input.TextArea readOnly value={JSON.stringify(generatedOperations.operations ?? [], null, 2)} autoSize={{ minRows: 6, maxRows: 20 }} /> }]} />
         <Input.TextArea
           value={comment}

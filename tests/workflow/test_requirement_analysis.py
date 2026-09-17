@@ -1,3 +1,4 @@
+import logging
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 
@@ -57,6 +58,17 @@ class FailingEmbeddingModel:
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         raise LLMServiceError("embedding service unavailable")
+
+
+class RecordingCompactionDispatcher:
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+        self.conversation_keys: list[str] = []
+
+    def dispatch_conversation_compaction(self, conversation_key: str) -> None:
+        self.conversation_keys.append(conversation_key)
+        if self.error is not None:
+            raise self.error
 
 
 @pytest_asyncio.fixture
@@ -151,6 +163,56 @@ def insufficient_info_conflict() -> dict[str, object]:
     }
 
 
+async def add_compaction_candidate(
+    session: AsyncSession,
+) -> RequirementConversation:
+    """Associate source 1 as the fourth turn of a conversation."""
+    conversation = RequirementConversation(
+        conversation_key="CONV-COMPACTION",
+        owner_id="user-1",
+        title="Compaction",
+    )
+    session.add(conversation)
+    prior_sources = [
+        SourceRecord(
+            id=source_id,
+            source_key=f"SRC-COMPACTION-{source_id}",
+            channel_type=ChannelType.WEB_FORM,
+            external_event_id=f"compaction-event-{source_id}",
+            submitter_id="user-1",
+            submitter_name="Tester",
+            raw_text=f"Earlier conversation message {source_id}",
+            raw_metadata={"input_surface": "conversation"},
+            received_at=datetime.now(UTC),
+            processing_status=ProcessingStatus.PENDING_REVIEW,
+        )
+        for source_id in (2, 3, 4)
+    ]
+    session.add_all(prior_sources)
+    await session.flush()
+    session.add_all(
+        [
+            ConversationMessage(
+                message_key=f"MSG-COMPACTION-{source_id}",
+                conversation_id=conversation.id,
+                source_record_id=source_id,
+                sequence_number=source_id - 1,
+            )
+            for source_id in (2, 3, 4)
+        ]
+        + [
+            ConversationMessage(
+                message_key="MSG-COMPACTION-CURRENT",
+                conversation_id=conversation.id,
+                source_record_id=1,
+                sequence_number=4,
+            )
+        ]
+    )
+    await session.commit()
+    return conversation
+
+
 async def test_workflow_reaches_pending_review(
     workflow_session: AsyncSession,
 ) -> None:
@@ -183,6 +245,67 @@ async def test_workflow_reaches_pending_review(
     assert len(records) == 2
     assert len(review_tasks) == 1
     assert review_tasks[0].analysis_snapshot["conflict_status"] == "duplicate"
+
+
+async def test_workflow_dispatches_compaction_after_threshold(
+    workflow_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conversation = await add_compaction_candidate(workflow_session)
+    dispatcher = RecordingCompactionDispatcher()
+    monkeypatch.setattr(
+        "requirement_agent.workflows.requirement_analysis.get_task_dispatcher",
+        lambda: dispatcher,
+    )
+    workflow = RequirementAnalysisWorkflow(
+        workflow_session,
+        FakeLLM([extraction(), conflict()], model_name="fake-chat"),
+        FakeLLM([], model_name="fake-embedding"),
+        max_retries=2,
+        retrieval_weights=RetrievalWeights(keyword=0.4, vector=0.4, business=0.2),
+        candidate_limit=20,
+        retriever=FakeRetriever([candidate()]),
+    )
+
+    await workflow.run(1)
+
+    assert dispatcher.conversation_keys == [conversation.conversation_key]
+
+
+async def test_compaction_dispatch_failure_is_logged_and_keeps_business_result(
+    workflow_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    await add_compaction_candidate(workflow_session)
+    dispatcher = RecordingCompactionDispatcher(RuntimeError("Redis unavailable"))
+    monkeypatch.setattr(
+        "requirement_agent.workflows.requirement_analysis.get_task_dispatcher",
+        lambda: dispatcher,
+    )
+    workflow = RequirementAnalysisWorkflow(
+        workflow_session,
+        FakeLLM([extraction(), conflict()], model_name="fake-chat"),
+        FakeLLM([], model_name="fake-embedding"),
+        max_retries=2,
+        retrieval_weights=RetrievalWeights(keyword=0.4, vector=0.4, business=0.2),
+        candidate_limit=20,
+        retriever=FakeRetriever([candidate()]),
+    )
+
+    with caplog.at_level(logging.ERROR):
+        await workflow.run(1)
+
+    source = await workflow_session.get(SourceRecord, 1)
+    reviews = (await workflow_session.execute(select(ReviewTask))).scalars().all()
+    assert source is not None
+    assert source.processing_status == ProcessingStatus.PENDING_REVIEW
+    assert len(reviews) == 1
+    assert dispatcher.conversation_keys == ["CONV-COMPACTION"]
+    assert "Conversation compaction dispatch failed" in caplog.text
+    assert "source_record_id=1" in caplog.text
+    assert "conversation_key=CONV-COMPACTION" in caplog.text
+    assert "Redis unavailable" in caplog.text
 
 
 async def test_workflow_rejects_requirement_outside_candidates(
