@@ -128,7 +128,9 @@ export function ConversationPage() {
   const hasActiveTurn = useMemo(
     () =>
       messages.some((item) =>
-        activeStatuses.has(item.source.processing_status),
+        (item.source !== null && activeStatuses.has(item.source.processing_status)) ||
+        item.chat_status === "pending" ||
+        item.chat_status === "processing",
       ),
     [messages],
   );
@@ -331,13 +333,46 @@ export function ConversationPage() {
       void message.error("请输入需求描述或选择附件");
       return;
     }
+    const rawText = text.trim();
+    const selectedFile = file;
+    const temporaryUserKey = `local-user-${crypto.randomUUID()}`;
+    const temporaryAssistantKey = `local-assistant-${crypto.randomUUID()}`;
+    const now = new Date().toISOString();
+    const temporaryUser: ConversationMessage = {
+      message_key: temporaryUserKey,
+      sequence_number: Number.MAX_SAFE_INTEGER - 1,
+      role: "user",
+      created_at: now,
+      source: null,
+      content: rawText || "请分析附件中的需求",
+      tool_calls: [],
+      references: [],
+      latest_extraction: null,
+      latest_conflict_analysis: null,
+      review_task: null,
+      chat_status: "submitted",
+    };
+    const temporaryAssistant: ConversationMessage = {
+      ...temporaryUser,
+      message_key: temporaryAssistantKey,
+      sequence_number: Number.MAX_SAFE_INTEGER,
+      role: "assistant",
+      content: "正在检索历史需求…",
+      chat_status: "pending",
+    };
+    // Render first. The server, not the browser, determines whether this is a query.
+    scrollMode.current = "send";
+    setMessages((current) => [...current, temporaryUser, temporaryAssistant]);
+    setText("");
+    setFile(null);
+    if (fileInputRef.current) fileInputRef.current.value = "";
     setSending(true);
     setError(null);
     try {
       const form = new FormData();
-      form.set("raw_text", text.trim());
+      form.set("raw_text", rawText);
       form.set("actor_name", session.actorName);
-      if (file) form.set("file", file);
+      if (selectedFile) form.set("file", selectedFile);
       const result = await api<CreateConversationMessageResponse>(
         `/api/v1/conversations/${encodeURIComponent(conversationKey)}/messages`,
         {
@@ -350,17 +385,21 @@ export function ConversationPage() {
         session,
       );
       if (activeKeyRef.current !== conversationKey) return;
-      scrollMode.current = "send";
       setMessages((current) =>
-        [...current.filter((item) => item.message_key !== result.message.message_key), result.message].sort(
+        [
+          ...current.filter((item) =>
+            item.message_key !== temporaryUserKey && item.message_key !== temporaryAssistantKey,
+          ),
+          result.message,
+          ...(result.assistant_message ? [result.assistant_message] : []),
+        ].sort(
           (left, right) => left.sequence_number - right.sequence_number,
         ),
       );
-      setText("");
-      setFile(null);
-      if (fileInputRef.current) fileInputRef.current.value = "";
       void message.success(
-        result.replayed ? "该消息已提交，正在同步分析状态" : "需求已保存，AI 正在分析",
+        result.intent === "traceability_query"
+          ? "查询回答已加入会话"
+          : result.replayed ? "该消息已提交，正在同步分析状态" : "需求已保存，AI 正在分析",
       );
       await Promise.all([
         loadMessages(conversationKey),
@@ -368,6 +407,11 @@ export function ConversationPage() {
       ]);
     } catch (caught) {
       setError(caught);
+      setMessages((current) => current.map((item) =>
+        item.message_key === temporaryAssistantKey
+          ? { ...item, chat_status: "failed", content: "发送失败，请重试" }
+          : item,
+      ));
     } finally {
       setSending(false);
     }
@@ -508,7 +552,7 @@ export function ConversationPage() {
       );
       setMessages((current) =>
         current.map((messageItem) =>
-          messageItem.message_key === item.message_key
+          messageItem.message_key === item.message_key && messageItem.source
             ? {
                 ...messageItem,
                 source: {
@@ -694,21 +738,21 @@ export function ConversationPage() {
           ) : messages.length === 0 ? (
             <EmptyBlock description="这个会话还没有需求，先在下方描述一个想法吧" />
           ) : (
-            messages.map((item) => (
-              <ConversationTurn
-                key={item.message_key}
-                source={item.source}
-                review={item.review_task ?? undefined}
-                onRetain={openDraft}
-                onReject={(task) => void reject(task)}
-                onRetry={() => void retry(item)}
+            messages.map((item) => item.source ? (
+              <ConversationTurn key={item.message_key} source={item.source}
+                review={item.review_task ?? undefined} onRetain={openDraft}
+                onReject={(task) => void reject(task)} onRetry={() => void retry(item)}
                 onAdvanced={(task) => navigate(`/reviews/${task.id}`)}
                 onOpenRequirement={(task) => {
-                  if (task.target_requirement_id) {
-                    navigate(`/requirements/${task.target_requirement_id}`);
-                  }
-                }}
-              />
+                  if (task.target_requirement_id) navigate(`/requirements/${task.target_requirement_id}`);
+                }} />
+            ) : (
+              <ChatConversationTurn key={item.message_key} message={item}
+                onReference={(reference) => navigate(
+                  reference.type === "source"
+                    ? `/sources/${encodeURIComponent(String(reference.id))}`
+                    : `/requirements?requirement_key=${encodeURIComponent(String(reference.id))}`,
+                )} />
             ))
           )}
         </div>
@@ -717,8 +761,8 @@ export function ConversationPage() {
           <Input.TextArea
             value={text}
             autoSize={{ minRows: 2, maxRows: 6 }}
-            placeholder="例如：报表页需要支持导出 PDF，文件中要包含当前筛选条件……"
-            aria-label="需求描述"
+            placeholder="请输入需求，或查询历史需求、来源和会话内容"
+            aria-label="会话消息"
             onChange={(event) => setText(event.target.value)}
             onPressEnter={(event) => {
               if (!event.shiftKey) {
@@ -758,7 +802,7 @@ export function ConversationPage() {
                 disabled={!conversationKey}
                 onClick={() => void sendRequirement()}
               >
-                提交需求
+                发送
               </Button>
             </Space>
           </div>
@@ -1040,6 +1084,47 @@ function ConversationTurn({
             />
           )}
         </div>
+      </div>
+    </div>
+  );
+}
+
+function ChatConversationTurn({
+  message,
+  onReference,
+}: {
+  message: ConversationMessage;
+  onReference: (reference: Record<string, unknown>) => void;
+}) {
+  const assistant = message.role === "assistant";
+  return (
+    <div className={`chat-row ${assistant ? "chat-row-assistant" : "chat-row-user"}`}>
+      <div className={`chat-avatar${assistant ? " assistant-avatar" : ""}`}>
+        {assistant ? <RobotOutlined /> : <UserOutlined />}
+      </div>
+      <div className={`chat-bubble ${assistant ? "assistant-bubble" : "user-bubble"}`}>
+        <Typography.Paragraph style={{ whiteSpace: "pre-wrap" }}>
+          {message.content}
+        </Typography.Paragraph>
+        {!!message.tool_calls.length && (
+          <Typography.Text type="secondary">
+            已调用：{message.tool_calls.map((item) => item.tool_name).join("、")}
+          </Typography.Text>
+        )}
+        {!!message.references.length && (
+          <Space wrap style={{ marginTop: 8 }}>
+            {message.references.map((reference) => (
+              <Button
+                key={`${String(reference.type)}-${String(reference.id)}`}
+                size="small"
+                onClick={() => onReference(reference)}
+              >
+                {reference.type === "source" ? "来源" : "需求"}：{String(reference.id)}
+              </Button>
+            ))}
+          </Space>
+        )}
+        <div className="chat-meta">{formatDate(message.created_at)}</div>
       </div>
     </div>
   );

@@ -3,6 +3,7 @@ from collections.abc import Mapping, Sequence
 
 import httpx
 
+from requirement_agent.ai.llm.base import ToolCall, ToolChatResponse
 from requirement_agent.shared.errors import (
     LLMEmptyContentError,
     LLMOutputBudgetExceededError,
@@ -157,6 +158,66 @@ class OpenAICompatibleChatModel(_OpenAICompatibleClient):
         except (KeyError, IndexError, TypeError):
             raise LLMServiceError(
                 "chat response has an invalid OpenAI-compatible shape"
+            ) from None
+
+    async def complete_with_tools(
+        self, messages: list[dict[str, object]], *, tools: list[dict[str, object]]
+    ) -> ToolChatResponse:
+        """Call the OpenAI tool protocol without changing structured-analysis calls."""
+        payload: dict[str, object] = {
+            "model": self._model,
+            "messages": messages,
+            "temperature": 0,
+            "max_tokens": self._max_tokens,
+            "tools": tools,
+            "tool_choice": "auto",
+        }
+        try:
+            response, _ = await self._post("/chat/completions", payload)
+            choices = response.get("choices")
+            if (
+                not isinstance(choices, Sequence)
+                or isinstance(choices, str | bytes)
+                or not choices
+            ):
+                raise TypeError("choices must be a nonempty array")
+            choice = choices[0]
+            if not isinstance(choice, Mapping) or not isinstance(
+                choice.get("message"), Mapping
+            ):
+                raise TypeError("message must be an object")
+            message = choice["message"]
+            raw_calls = message.get("tool_calls", message.get("function_call"))
+            calls: list[ToolCall] = []
+            if isinstance(raw_calls, Mapping):
+                raw_calls = [raw_calls]
+            if isinstance(raw_calls, Sequence) and not isinstance(raw_calls, str | bytes):
+                for index, item in enumerate(raw_calls):
+                    if not isinstance(item, Mapping):
+                        continue
+                    function = item.get("function", item)
+                    if not isinstance(function, Mapping):
+                        continue
+                    name = function.get("name")
+                    arguments = function.get("arguments", "{}")
+                    if isinstance(name, str) and isinstance(arguments, str):
+                        calls.append(
+                            ToolCall(
+                                id=str(item.get("id") or f"call_{index}"),
+                                name=name,
+                                arguments=arguments,
+                            )
+                        )
+            content = message.get("content")
+            return ToolChatResponse(
+                content=content if isinstance(content, str) else None,
+                tool_calls=calls,
+            )
+        except (LLMServiceError, httpx.HTTPError):
+            raise
+        except (KeyError, TypeError, ValueError):
+            raise LLMServiceError(
+                "tool chat response has an invalid OpenAI-compatible shape"
             ) from None
 
     def _log_chat_response(

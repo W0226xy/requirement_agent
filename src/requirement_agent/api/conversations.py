@@ -1,3 +1,5 @@
+import logging
+from time import perf_counter
 from typing import Annotated
 
 from fastapi import (
@@ -19,6 +21,8 @@ from sqlalchemy.orm import selectinload
 from requirement_agent.api.dependencies import get_actor_id, get_ingestion_service
 from requirement_agent.api.schemas.analysis import ReanalyzeResponse
 from requirement_agent.api.schemas.conversations import (
+    ChatQueryRequest,
+    ChatQueryResponse,
     ConversationListResponse,
     ConversationMessageListResponse,
     ConversationMessageResponse,
@@ -27,9 +31,17 @@ from requirement_agent.api.schemas.conversations import (
     CreateConversationRequest,
     UpdateConversationRequest,
 )
+from requirement_agent.ai.llm.factory import get_embedding_model, get_llm
+from requirement_agent.ai.retrieval.hybrid import HybridRetriever, RetrievalWeights
+from requirement_agent.application.chat_agent import ChatAgentService
+from requirement_agent.application.chat_tools import ChatToolService
 from requirement_agent.api.schemas.reviews import ReviewTaskResponse
 from requirement_agent.api.schemas.sources import SourceRecordResponse
 from requirement_agent.application.conversations import ConversationService
+from requirement_agent.application.conversations.intent import (
+    ConversationIntent,
+    classify_conversation_message,
+)
 from requirement_agent.application.ingestion.dispatcher import (
     TaskDispatcher,
     get_task_dispatcher,
@@ -49,6 +61,7 @@ from requirement_agent.shared.enums import AnalysisType, ProcessingStatus
 from requirement_agent.shared.errors import FileTooLargeError
 
 router = APIRouter(prefix="/api/v1/conversations", tags=["conversations"])
+logger = logging.getLogger(__name__)
 
 
 def _service(
@@ -163,6 +176,28 @@ async def clear_conversation_context(
     return ConversationResponse.model_validate(conversation)
 
 
+@router.post("/{conversation_key}/chat", response_model=ChatQueryResponse)
+async def query_conversation_agent(
+    conversation_key: str,
+    payload: ChatQueryRequest,
+    actor_id: Annotated[str, Depends(get_actor_id)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+    ingestion_service: Annotated[IngestionService, Depends(get_ingestion_service)],
+) -> ChatQueryResponse:
+    """Read-only Q&A endpoint; it never creates a SourceRecord or dispatches Celery."""
+    await _service(session, ingestion_service).get(conversation_key, actor_id)
+    settings = get_settings()
+    retriever = HybridRetriever(session, get_embedding_model(), RetrievalWeights(
+        keyword=settings.retrieval_keyword_weight, vector=settings.retrieval_vector_weight,
+        business=settings.retrieval_business_weight), candidate_limit=settings.retrieval_candidate_limit,
+        min_similarity_score=settings.retrieval_min_similarity_score)
+    tool_service = ChatToolService(session, retriever, actor_id)
+    answer, tool_calls, references = await ChatAgentService(
+        session, get_llm(), tool_service, actor_id, conversation_key
+    ).answer(payload.message)
+    return ChatQueryResponse(answer=answer, tool_calls=tool_calls, references=references)
+
+
 @router.get(
     "/{conversation_key}/messages",
     response_model=ConversationMessageListResponse,
@@ -216,6 +251,7 @@ async def create_conversation_message(
     actor_id: Annotated[str, Depends(get_actor_id)],
     session: Annotated[AsyncSession, Depends(get_session)],
     ingestion_service: Annotated[IngestionService, Depends(get_ingestion_service)],
+    dispatcher: Annotated[TaskDispatcher, Depends(get_task_dispatcher)],
     idempotency_key: Annotated[
         str,
         Header(alias="Idempotency-Key", min_length=8, max_length=255),
@@ -231,6 +267,51 @@ async def create_conversation_message(
 
         raise ConnectorVerificationError("a message requires raw_text or a file")
     service = _service(session, ingestion_service)
+    intent = classify_conversation_message(text, has_attachment=attachment is not None)
+    if intent == ConversationIntent.CLARIFICATION:
+        user_message = await service.add_chat_message(
+            conversation_key=conversation_key, owner_id=actor_id, role="user", content=text
+        )
+        assistant_message = await service.add_chat_message(
+            conversation_key=conversation_key, owner_id=actor_id, role="assistant",
+            content="请说明这是新需求，还是要查询历史需求、来源或当前会话内容。",
+        )
+        projected = await _project_messages(session, [user_message, assistant_message])
+        response.status_code = status.HTTP_200_OK
+        return CreateConversationMessageResponse(
+            message=projected[0], assistant_message=projected[1], replayed=False,
+            intent=intent.value,
+        )
+    if intent == ConversationIntent.TRACEABILITY_QUERY:
+        started = perf_counter()
+        logger.info("chat_query_submit_started conversation_key=%s", conversation_key)
+        user_message = await service.add_chat_message(
+            conversation_key=conversation_key, owner_id=actor_id, role="user", content=text
+        )
+        logger.info("chat_query_user_persisted conversation_key=%s elapsed_ms=%d", conversation_key, round((perf_counter() - started) * 1000))
+        assistant_message = await service.add_chat_message(
+            conversation_key=conversation_key, owner_id=actor_id, role="assistant",
+            content="正在检索历史需求…", chat_status="pending",
+            reply_to_message_id=user_message.id,
+        )
+        logger.info("chat_query_placeholder_persisted conversation_key=%s elapsed_ms=%d", conversation_key, round((perf_counter() - started) * 1000))
+        try:
+            dispatcher.dispatch_chat_query(
+                conversation_key, user_message.id, assistant_message.id, actor_id
+            )
+            logger.info("chat_query_task_dispatched conversation_key=%s elapsed_ms=%d", conversation_key, round((perf_counter() - started) * 1000))
+        except Exception:
+            assistant_message.chat_status = "failed"
+            assistant_message.content = "查询处理失败，请重试"
+            await session.commit()
+            raise
+        projected = await _project_messages(session, [user_message, assistant_message])
+        response.status_code = status.HTTP_202_ACCEPTED
+        logger.info("chat_query_submit_accepted conversation_key=%s elapsed_ms=%d", conversation_key, round((perf_counter() - started) * 1000))
+        return CreateConversationMessageResponse(
+            message=projected[0], assistant_message=projected[1], replayed=False,
+            intent=intent.value,
+        )
     message, result = await service.add_message(
         conversation_key=conversation_key,
         owner_id=actor_id,
@@ -256,6 +337,7 @@ async def create_conversation_message(
     return CreateConversationMessageResponse(
         message=projected[0],
         replayed=result.replayed,
+        intent=intent.value,
     )
 
 
@@ -306,7 +388,7 @@ async def _project_messages(
 ) -> list[ConversationMessageResponse]:
     if not messages:
         return []
-    source_ids = [message.source_record_id for message in messages]
+    source_ids = [message.source_record_id for message in messages if message.source_record_id]
     analyses = (
         await session.execute(
             select(AnalysisResult)
@@ -340,10 +422,12 @@ async def _project_messages(
             sequence_number=message.sequence_number,
             role=message.role,
             created_at=message.created_at,
-            source=SourceRecordResponse.from_model(
-                message.source_record,
-                include_attachments=True,
-            ),
+            source=(SourceRecordResponse.from_model(message.source_record, include_attachments=True)
+                    if message.source_record else None),
+            content=message.content or (message.source_record.raw_text if message.source_record else ""),
+            tool_calls=message.tool_calls,
+            references=message.references,
+            chat_status=message.chat_status,
             latest_extraction=latest_analysis.get(
                 (message.source_record_id, AnalysisType.EXTRACTION)
             ),

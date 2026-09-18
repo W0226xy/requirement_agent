@@ -96,6 +96,26 @@ async def test_conversation_summary_does_not_request_json_object_mode() -> None:
     assert "response_format" not in json.loads(requests[0].content)
 
 
+async def test_chat_parses_openai_tool_calls_and_sends_tool_definitions() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"choices": [{"message": {"content": None,
+            "tool_calls": [{"id": "call-1", "type": "function", "function": {
+                "name": "search_requirements", "arguments": '{"query": "歌词"}'}}]}}]})
+
+    chat = OpenAICompatibleChatModel(base_url="https://chat.example/v1", api_key="secret",
+        model="chat-model", timeout_seconds=10, max_tokens=512, transport=httpx.MockTransport(handler))
+    response = await chat.complete_with_tools([{"role": "user", "content": "查歌词"}], tools=[{
+        "type": "function", "function": {"name": "search_requirements", "parameters": {"type": "object"}}
+    }])
+
+    assert response.tool_calls[0].name == "search_requirements"
+    assert response.tool_calls[0].arguments == '{"query": "歌词"}'
+    assert json.loads(requests[0].content)["tools"][0]["function"]["name"] == "search_requirements"
+
+
 async def test_embedding_rejects_wrong_dimension() -> None:
     transport = httpx.MockTransport(
         lambda request: httpx.Response(

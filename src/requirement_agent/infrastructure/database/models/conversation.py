@@ -19,6 +19,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from requirement_agent.infrastructure.database.base import Base
+from requirement_agent.shared.enums import ChatMessageStatus
 
 if TYPE_CHECKING:
     from requirement_agent.infrastructure.database.models.source import SourceRecord
@@ -117,10 +118,10 @@ class ConversationMessage(Base):
         ForeignKey("requirement_conversation.id", ondelete="RESTRICT"),
         nullable=False,
     )
-    source_record_id: Mapped[int] = mapped_column(#关联到已有的 SourceRecord，复用原有的需求文本、附件、OCR 结果和解析结果。
+    source_record_id: Mapped[int | None] = mapped_column(#需求提交消息关联 SourceRecord；纯聊天消息不创建来源。
         BIGINT_PK,
         ForeignKey("source_record.id", ondelete="RESTRICT"),
-        nullable=False,
+        nullable=True,
         unique=True,
     )
     sequence_number: Mapped[int] = mapped_column(Integer, nullable=False)#消息在会话中的顺序号，从 1 开始递增，确保消息按时间顺序排列。
@@ -130,6 +131,20 @@ class ConversationMessage(Base):
         default="user",
         server_default="user",
     )
+    content: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    tool_calls: Mapped[list[dict[str, object]]] = mapped_column(
+        JSON_DATA, nullable=False, default=list, server_default=text("'[]'")
+    )
+    references: Mapped[list[dict[str, object]]] = mapped_column(
+        JSON_DATA, nullable=False, default=list, server_default=text("'[]'")
+    )
+    chat_status: Mapped[ChatMessageStatus] = mapped_column(
+        String(32), nullable=False, default=ChatMessageStatus.SUBMITTED.value,
+        server_default=ChatMessageStatus.SUBMITTED.value,
+    )
+    reply_to_message_id: Mapped[int | None] = mapped_column(
+        BIGINT_PK, ForeignKey("conversation_message.id", ondelete="RESTRICT")
+    )
     created_at: Mapped[datetime] = mapped_column(#消息创建时间
         DateTime(timezone=True),
         nullable=False,
@@ -137,4 +152,4 @@ class ConversationMessage(Base):
     )
 
     conversation: Mapped[RequirementConversation] = relationship(back_populates="messages")
-    source_record: Mapped["SourceRecord"] = relationship(back_populates="conversation_message")
+    source_record: Mapped["SourceRecord | None"] = relationship(back_populates="conversation_message")

@@ -1,4 +1,5 @@
 import hashlib
+import re
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -173,6 +174,34 @@ class ConversationService:
         )
         self._ingestion.dispatch(result.source)
         return message, result
+
+    async def add_chat_message(
+        self, *, conversation_key: str, owner_id: str, role: str, content: str,
+        tool_calls: list[dict[str, object]] | None = None,
+        references: list[dict[str, object]] | None = None,
+        chat_status: str = "submitted", reply_to_message_id: int | None = None,
+    ) -> ConversationMessage:
+        """Persist a query/answer turn without creating a SourceRecord."""
+        conversation = await self.get(conversation_key, owner_id, for_update=True)
+        maximum = await self._session.scalar(select(func.coalesce(
+            func.max(ConversationMessage.sequence_number), 0
+        )).where(ConversationMessage.conversation_id == conversation.id))
+        message = ConversationMessage(
+            message_key=f"MSG-{uuid4().hex[:24].upper()}",
+            conversation_id=conversation.id,
+            sequence_number=(maximum or 0) + 1,
+            role=role,
+            content=content,
+            tool_calls=tool_calls or [],
+            references=references or [],
+            chat_status=chat_status,
+            reply_to_message_id=reply_to_message_id,
+        )
+        self._session.add(message)
+        conversation.updated_at = datetime.now(UTC)
+        await self._session.commit()
+        await self._session.refresh(message)
+        return message
 
     async def load_message(
         self,

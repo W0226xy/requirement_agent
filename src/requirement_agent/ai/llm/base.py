@@ -1,5 +1,18 @@
 from typing import Protocol
 
+from pydantic import BaseModel
+
+
+class ToolCall(BaseModel):
+    id: str
+    name: str
+    arguments: str
+
+
+class ToolChatResponse(BaseModel):
+    content: str | None = None
+    tool_calls: list[ToolCall] = []
+
 
 class ChatModel(Protocol):
     @property
@@ -12,6 +25,11 @@ class ChatModel(Protocol):
         *,
         analysis_type: str | None = None,
     ) -> str:
+        ...
+
+    async def complete_with_tools(
+        self, messages: list[dict[str, object]], *, tools: list[dict[str, object]]
+    ) -> ToolChatResponse:
         ...
 
 

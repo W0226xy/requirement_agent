@@ -13,4 +13,4 @@ build/
 .idea/
 node_modules/
 apps/web/dist/
-
+reports/

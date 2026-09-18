@@ -1,8 +1,12 @@
+import logging
+import math
+import re
 from dataclasses import dataclass
 from time import perf_counter
 
 from sqlalchemy import Float, case, cast, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 from sqlalchemy.sql.elements import ColumnElement
 
 from requirement_agent.ai.llm.base import EmbeddingModel
@@ -11,8 +15,12 @@ from requirement_agent.infrastructure.database.models import (
     AnalysisResult,
     Requirement,
     RequirementEmbedding,
+    RequirementVersion,
 )
 from requirement_agent.shared.enums import AnalysisType
+
+logger = logging.getLogger(__name__)
+
 #这段代码实现的是项目中的 混合检索器 HybridRetriever。它属于 RAG 的“检索”部分：
 #Retrieval-Augmented Generation（RAG）是一种结合了检索和生成的技术，用于增强语言模型的能力。
 #RAG 的核心思想是：在生成回答之前，先从外部知识库中检索相关信息，然后将这些信息作为上下文提供给语言模型，从而提高回答的准确性和丰富性。
@@ -164,6 +172,106 @@ class HybridRetriever:
             self._min_similarity_score,
         )
 
+    async def search_traceability(
+        self,
+        query: str,
+        *,
+        query_modules: list[str],
+        filters: SearchFilters | None = None,
+    ) -> list[RequirementCandidate]:
+        """Reuse hybrid retrieval, then cover formal versions not yet embedded.
+
+        The normal analysis path remains unchanged.  This read-only path only
+        falls back when the embedding-index candidate set yields no answer.
+        """
+        selected_filters = filters or SearchFilters()
+        candidates = await self.search(
+            query,
+            source_record_id=None,
+            query_modules=query_modules,
+            filters=selected_filters,
+        )
+        if candidates:
+            logger.info(
+                "traceability_retrieval embedded_candidates=%s fallback_candidates=0 final_candidates=%s",
+                len(candidates), len(candidates),
+            )
+            return candidates
+        fallback_documents, formal_count = await self._formal_requirement_fallback(
+            query, selected_filters
+        )
+        fallback = rank_documents(
+            fallback_documents,
+            self._weights,
+            self._candidate_limit,
+            min_similarity_score=0.1,
+        )
+        logger.info(
+            "traceability_retrieval formal_candidates=%s embedded_candidates=0 "
+            "keyword_module_candidates=%s final_candidates=%s",
+            formal_count, len(fallback_documents), len(fallback),
+        )
+        return fallback
+
+    async def _formal_requirement_fallback(
+        self, query: str, filters: SearchFilters
+    ) -> tuple[list[ScoredDocument], int]:
+        """Search current formal versions without requiring an embedding row."""
+        rows = list((await self._session.execute(
+            select(Requirement).options(
+                selectinload(Requirement.versions).selectinload(RequirementVersion.features)
+            ).where(Requirement.current_version_id.is_not(None))
+        )).scalars())
+        formal_count = len(rows)
+        documents: list[ScoredDocument] = []
+        normalized_query = _normalized_text(query)
+        for requirement in rows:
+            if filters.statuses and requirement.status.value not in filters.statuses:
+                continue
+            if filters.modules and not set(requirement.functional_modules).intersection(filters.modules):
+                continue
+            version = next(
+                (item for item in requirement.versions if item.id == requirement.current_version_id),
+                None,
+            )
+            if version is None:
+                continue
+            feature_data = [
+                {
+                    "feature_key": item.feature_key,
+                    "module": item.module,
+                    "feature_title": item.feature_title,
+                    "feature_description": item.feature_description,
+                    "acceptance_criteria": item.acceptance_criteria,
+                }
+                for item in version.features
+            ]
+            content = "\n".join([
+                requirement.title,
+                " ".join(requirement.functional_modules),
+                *[f"{item.feature_title} {item.feature_description}" for item in version.features],
+            ])
+            module_match = any(
+                module and (module in normalized_query or normalized_query in module)
+                for module in map(_normalized_text, requirement.functional_modules)
+            )
+            keyword_score = _portable_keyword_score(query, content)
+            if not module_match and keyword_score < 0.1:
+                continue
+            documents.append(ScoredDocument(
+                requirement_key=requirement.requirement_key,
+                version_number=version.version_number,
+                title=requirement.title,
+                functional_modules=list(requirement.functional_modules),
+                features=feature_data,
+                sources=[],
+                content=content,
+                keyword_score=max(keyword_score, 0.5 if module_match else 0.0),
+                vector_score=0.0,
+                business_score=1.0 if module_match else 0.0,
+            ))
+        return documents, formal_count
+
     async def _query_documents(#执行实际数据库检索
         self,
         query: str,
@@ -171,6 +279,15 @@ class HybridRetriever:
         query_modules: list[str],
         filters: SearchFilters,
     ) -> list[ScoredDocument]:
+        # SQLite does not implement PostgreSQL full-text search or pgvector.  This
+        # narrow fallback is used by the isolated, deterministic offline RAG
+        # evaluation database; production continues through the PostgreSQL query
+        # below unchanged.
+        bind = self._session.get_bind()
+        if bind.dialect.name == "sqlite":
+            return await self._query_documents_sqlite(
+                query, query_embedding, query_modules, filters
+            )
         #关键字匹配得分：使用 PostgreSQL 的全文搜索功能，计算查询文本与需求标题和内容的匹配度
         search_text = RequirementEmbedding.title + literal(" ") + RequirementEmbedding.content#历史需求标题 + 空格 + 历史需求正文
         search_vector = func.to_tsvector("simple", search_text)#将历史需求标题和正文转换为文本搜索向量
@@ -245,6 +362,43 @@ class HybridRetriever:
             for row in rows
         ]
 
+    async def _query_documents_sqlite(
+        self,
+        query: str,
+        query_embedding: list[float],
+        query_modules: list[str],
+        filters: SearchFilters,
+    ) -> list[ScoredDocument]:
+        """Portable scoring for the isolated SQLite evaluation harness only."""
+        statement = select(RequirementEmbedding).join(
+            Requirement, Requirement.id == RequirementEmbedding.requirement_id
+        ).where(Requirement.current_version_id == RequirementEmbedding.version_id)
+        rows = (await self._session.execute(statement)).scalars().all()
+        documents: list[ScoredDocument] = []
+        for item in rows:
+            if filters.statuses and item.status not in filters.statuses:
+                continue
+            if filters.modules and not (
+                item.module in filters.modules
+                or set(item.functional_modules).intersection(filters.modules)
+            ):
+                continue
+            documents.append(
+                ScoredDocument(
+                    requirement_key=item.requirement_key,
+                    version_number=item.version_number,
+                    title=item.title,
+                    functional_modules=list(item.functional_modules),
+                    features=list(item.features),
+                    sources=list(item.sources),
+                    content=item.content,
+                    keyword_score=_portable_keyword_score(query, f"{item.title} {item.content}"),
+                    vector_score=_cosine_similarity(query_embedding, item.embedding),
+                    business_score=float(item.module in query_modules),
+                )
+            )
+        return documents
+
     async def _record_embedding(
         self,
         source_record_id: int,
@@ -273,3 +427,37 @@ class HybridRetriever:
             )
         )
         await self._session.commit()
+
+
+def _portable_keyword_score(query: str, document: str) -> float:
+    """Character n-gram overlap for SQLite-only offline evaluation."""
+    query_terms = _portable_terms(query)
+    if not query_terms:
+        return 0.0
+    document_terms = _portable_terms(document)
+    return len(query_terms.intersection(document_terms)) / len(query_terms)
+
+
+def _portable_terms(text: str) -> set[str]:
+    normalized = re.sub(r"\s+", "", text.lower())
+    terms = set(re.findall(r"[a-z0-9]+", text.lower()))
+    terms.update(normalized[index : index + 2] for index in range(len(normalized) - 1))
+    return terms
+
+
+def _normalized_text(text: str) -> str:
+    return re.sub(r"\s+", "", text.casefold())
+
+
+def _cosine_similarity(left: list[float], right: list[float]) -> float:
+    if len(left) != len(right) or not left or not right:
+        return 0.0
+    denominator = math.sqrt(sum(value * value for value in left)) * math.sqrt(
+        sum(value * value for value in right)
+    )
+    if denominator == 0:
+        return 0.0
+    return min(
+        1.0,
+        max(0.0, sum(a * b for a, b in zip(left, right, strict=True)) / denominator),
+    )

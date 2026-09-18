@@ -45,7 +45,11 @@ class ConversationMessageResponse(BaseModel):
     sequence_number: int
     role: str
     created_at: datetime
-    source: SourceRecordResponse
+    source: SourceRecordResponse | None
+    content: str
+    tool_calls: list[dict[str, object]] = Field(default_factory=list)
+    references: list[dict[str, object]] = Field(default_factory=list)
+    chat_status: str = "submitted"
     latest_extraction: dict[str, object] | None
     latest_conflict_analysis: dict[str, object] | None
     review_task: ReviewTaskResponse | None
@@ -61,3 +65,24 @@ class ConversationMessageListResponse(BaseModel):
 class CreateConversationMessageResponse(BaseModel):
     message: ConversationMessageResponse
     replayed: bool
+    intent: str = "requirement_submission"
+    assistant_message: ConversationMessageResponse | None = None
+
+
+class ChatQueryRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    message: str = Field(min_length=1, max_length=4_000)
+    context: dict[str, object] = Field(default_factory=dict)
+
+
+class ChatToolCallSummary(BaseModel):
+    tool_name: str
+    ok: bool
+    summary: str
+
+
+class ChatQueryResponse(BaseModel):
+    answer: str
+    tool_calls: list[ChatToolCallSummary]
+    references: list[dict[str, object]]

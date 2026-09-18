@@ -57,7 +57,11 @@ export type ConversationMessage = {
   sequence_number: number;
   role: string;
   created_at: string;
-  source: SourceRecord;
+  source: SourceRecord | null;
+  content: string;
+  tool_calls: { tool_name: string; ok: boolean; summary: string }[];
+  references: Record<string, unknown>[];
+  chat_status: string;
   latest_extraction: Record<string, unknown> | null;
   latest_conflict_analysis: Record<string, unknown> | null;
   review_task: ReviewTask | null;
@@ -66,6 +70,14 @@ export type ConversationMessage = {
 export type CreateConversationMessageResponse = {
   message: ConversationMessage;
   replayed: boolean;
+  intent: string;
+  assistant_message: ConversationMessage | null;
+};
+
+export type ChatQueryResponse = {
+  answer: string;
+  tool_calls: { tool_name: string; ok: boolean; summary: string }[];
+  references: Record<string, unknown>[];
 };
 
 export type FeatureLineage = {

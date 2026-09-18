@@ -97,7 +97,7 @@ async def compact_conversation(
         )).scalars())
         if not messages:
             return False
-        source_ids = [item.source_record_id for item in messages]
+        source_ids = [item.source_record_id for item in messages if item.source_record_id]
         analyses = list((await session.execute(select(AnalysisResult).where(
             AnalysisResult.source_record_id.in_(source_ids),
             AnalysisResult.analysis_type.in_([AnalysisType.EXTRACTION, AnalysisType.CONFLICT_RISK]),
@@ -115,7 +115,7 @@ async def compact_conversation(
         facts = [{
             "SourceRecord ID": item.source_record_id,
             "消息序号": item.sequence_number,
-            "用户消息": item.source_record.raw_text[:2000],
+            "用户消息": (item.source_record.raw_text if item.source_record else item.content)[:2000],
             "最新需求提取": _summary_evidence(
                 latest.get((item.source_record_id, AnalysisType.EXTRACTION)),
                 ("requirement_summary", "requirement_description", "functional_modules",

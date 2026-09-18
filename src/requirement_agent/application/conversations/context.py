@@ -115,10 +115,10 @@ async def load_conversation_context(
             "source_record_id": message.source_record_id,
             "sequence_number": message.sequence_number,
             "role": message.role,
-            "content": source.raw_text.strip(),
+            "content": (source.raw_text if source else message.content).strip(),
             "attachments": [
                 {"file_name": attachment.file_name, "source_record_id": message.source_record_id}
-                for attachment in source.attachments
+                for attachment in (source.attachments if source else [])
             ],
         }
         block = _serialize_payload_within_limit(payload, remaining)

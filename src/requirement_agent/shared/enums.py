@@ -43,6 +43,7 @@ class AuditActionType(StrEnum):
     REVIEW_REJECTED = "review_rejected"
     REVIEW_RETURNED = "review_returned"
     REQUIREMENT_VERSION_CREATED = "requirement_version_created"
+    AGENT_TOOL_CALLED = "agent_tool_called"
 
 
 class AuditEntityType(StrEnum):
@@ -52,6 +53,15 @@ class AuditEntityType(StrEnum):
     REVIEW_TASK = "review_task"
     REQUIREMENT = "requirement"
     REQUIREMENT_VERSION = "requirement_version"
+    CONVERSATION = "conversation"
+
+
+class ChatMessageStatus(StrEnum):
+    SUBMITTED = "submitted"
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
 
 
 class AnalysisType(StrEnum):

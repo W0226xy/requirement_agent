@@ -259,6 +259,45 @@ curl -X POST http://localhost:8000/api/v1/search \
 `requirement_embedding` 是不可变检索投影，只索引正式版本；混合检索会过滤掉历史投影，
 仅返回需求主表指向的当前版本。
 
+### 离线 RAG Recall@K 评测
+
+`tests/fixtures/rag_eval_cases.jsonl` 是人工标注的固定评测集，用于衡量
+`HybridRetriever` 是否能召回正确的、已审核的当前正式需求。每行是一个 JSON 对象：
+
+```json
+{
+  "case_id": "rag-001",
+  "query": {
+    "requirement_summary": "车辆中心保养提醒入口调整",
+    "requirement_description": "仅在车辆中心展示下次保养日期和剩余里程。",
+    "functional_modules": ["车辆保养提醒", "车辆中心"]
+  },
+  "relevant_requirement_keys": ["REQ-EVAL-001"],
+  "relation_type": "modify",
+  "note": "人工标注依据"
+}
+```
+
+`relevant_requirement_keys` 是人工确认的答案；它为空时必须填写
+`skip_reason`，该样本会保留在报告中但不参与 Macro Recall。指标以去重后的
+`requirement_key` 计算：`Recall@K = |Top-K ∩ relevant| / |relevant|`，因此一个
+需求的多个投影不会占用多个名额。新增样本时请只使用固定种子中存在的需求 key，人工
+填写答案、关系类型和标注说明，并运行测试确认 JSONL 合法。
+
+运行完全隔离的评测（不会使用或写入开发数据库，也不会调用聊天模型或外部 Embedding）：
+
+```bash
+python -m requirement_agent.evaluation.rag \
+  --dataset tests/fixtures/rag_eval_cases.jsonl \
+  --ks 1 3 5 10 \
+  --output reports/rag_evaluation.json
+```
+
+命令同时输出 JSON 报告和简表，比较 Keyword only（仅全文关键词）、Vector only（仅向量）
+与 Hybrid（0.4/0.4/0.2）。离线种子使用确定性本地 Embedding，便于回归测试；生产环境
+仍使用 PostgreSQL 全文检索、pgvector 和既有默认权重。结果适合比较同一固定数据集上的
+回归趋势，不应直接外推为生产流量指标。
+
 ## 人工审核和版本提交
 
 AI 分析完成后会幂等创建一条 `review_task`。审核数据与正式版本严格分离，只有拥有
