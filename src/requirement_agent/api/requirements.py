@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, status as http_status
 from sqlalchemy import cast, func, select, true
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,6 +14,12 @@ from requirement_agent.api.schemas.requirements import (
     RequirementFeatureResponse,
     RequirementListResponse,
     RequirementModuleListResponse,
+    RequirementOverviewItemResponse,
+    ModuleOverviewHistoryResponse,
+    ModuleOverviewResponse,
+    ModuleOverviewRevisionResponse,
+    RequirementOverviewModuleResponse,
+    RequirementOverviewResponse,
     RequirementResponse,
     RequirementVersionListResponse,
     RequirementVersionResponse,
@@ -23,7 +29,10 @@ from requirement_agent.infrastructure.database.models import (
     Requirement,
     RequirementFeature,
     RequirementVersion,
+    ModuleOverview,
+    ModuleOverviewRevision,
 )
+from requirement_agent.application.ingestion.dispatcher import TaskDispatcher, get_task_dispatcher
 from requirement_agent.infrastructure.database.session import get_session
 from requirement_agent.shared.enums import RequirementStatus
 from requirement_agent.shared.errors import RequirementNotFoundError
@@ -96,6 +105,90 @@ async def list_requirement_modules(
         )
     ).scalars()
     return RequirementModuleListResponse(items=list(values))
+
+
+@router.get("/overview", response_model=RequirementOverviewResponse)
+async def get_requirement_overview(
+    session: Annotated[AsyncSession, Depends(get_session)],
+    status: RequirementStatus | None = None,
+    module: str | None = None,
+    keyword: str | None = None,
+) -> RequirementOverviewResponse:
+    """Read-only grouping of formal requirements and their current-version features."""
+    filters = [Requirement.current_version_id.is_not(None)]
+    if status is not None:
+        filters.append(Requirement.status == status)
+    versions = (
+        await session.execute(
+            select(Requirement, RequirementVersion)
+            .join(RequirementVersion, Requirement.current_version_id == RequirementVersion.id)
+            .options(selectinload(RequirementVersion.features))
+            .where(*filters)
+            .order_by(Requirement.updated_at.desc(), Requirement.id.desc())
+        )
+    ).all()
+    version_ids = [version.id for _, version in versions]
+    source_ids_by_version: dict[int, int] = {}
+    if version_ids:
+        lineages = (
+            await session.execute(
+                select(FeatureLineage.introduced_version_id, FeatureLineage.source_record_id)
+                .where(FeatureLineage.introduced_version_id.in_(version_ids))
+                .order_by(FeatureLineage.source_record_id)
+            )
+        ).all()
+        for version_id, source_record_id in lineages:
+            source_ids_by_version.setdefault(version_id, source_record_id)
+
+    grouped: dict[str, list[RequirementOverviewItemResponse]] = {}
+    keyword_normalized = keyword.strip().lower() if keyword else ""
+    module_normalized = module.strip() if module else ""
+    for requirement, version in versions:
+        description = _overview_description(version)
+        modules = sorted({*requirement.functional_modules, *(feature.module for feature in version.features if feature.module)})
+        if not modules:
+            modules = ["未分类"]
+        if keyword_normalized and keyword_normalized not in " ".join((
+            requirement.requirement_key, requirement.title, description
+        )).lower():
+            continue
+        if module_normalized and module_normalized not in modules:
+            continue
+        item = RequirementOverviewItemResponse(
+            id=requirement.id, requirement_key=requirement.requirement_key,
+            title=requirement.title, description=description, status=requirement.status,
+            source_record_id=source_ids_by_version.get(version.id),
+        )
+        for name in modules:
+            grouped.setdefault(name, []).append(item)
+    overview_rows = (await session.execute(select(ModuleOverview).where(ModuleOverview.module_name.in_(list(grouped))))).scalars()
+    overview_by_name = {item.module_name: item for item in overview_rows}
+    return RequirementOverviewResponse(
+        total_requirements=len({item.id for items in grouped.values() for item in items}),
+        modules=[RequirementOverviewModuleResponse(
+            name=name, requirement_count=len(items),
+            status_counts=dict(_status_counts(items)), requirements=items,
+            module_overview=_overview_response(overview_by_name.get(name)),
+        ) for name, items in sorted(grouped.items())],
+    )
+
+
+@router.get("/overview/modules/{module_name}/history", response_model=ModuleOverviewHistoryResponse)
+async def module_overview_history(module_name: str, session: Annotated[AsyncSession, Depends(get_session)]) -> ModuleOverviewHistoryResponse:
+    rows = (await session.execute(
+        select(ModuleOverviewRevision)
+        .join(ModuleOverview)
+        .where(ModuleOverview.module_name == module_name)
+        .order_by(ModuleOverviewRevision.created_at.desc(), ModuleOverviewRevision.id.desc())
+    )).scalars()
+    return ModuleOverviewHistoryResponse(items=[ModuleOverviewRevisionResponse.model_validate(item) for item in rows])
+
+
+@router.post("/overview/modules/{module_name}/refresh", status_code=http_status.HTTP_202_ACCEPTED)
+async def refresh_module_overview(module_name: str, dispatcher: Annotated[TaskDispatcher, Depends(get_task_dispatcher)]) -> dict[str, str]:
+    """Queue a controlled refresh; this endpoint never invokes the LLM inline."""
+    dispatcher.dispatch_module_overview(module_name, change_type="manual_refresh", change_reason="manual refresh")
+    return {"status": "updating"}
 
 
 @router.get("/{requirement_id}", response_model=RequirementResponse)
@@ -272,3 +365,37 @@ def _has_functional_module(
         return cast(Requirement.functional_modules, JSONB).contains([module])
     modules = _functional_module_values(session)
     return select(1).select_from(modules).where(modules.c.value == module).exists()
+
+
+def _overview_description(version: RequirementVersion) -> str:
+    snapshot = version.requirement_snapshot
+    value = snapshot.get("description") or snapshot.get("requirement_description")
+    if isinstance(value, str) and value.strip():
+        return _short_text(value)
+    descriptions = [feature.feature_description for feature in version.features if feature.feature_description]
+    return _short_text("；".join(descriptions)) if descriptions else "暂无需求描述"
+
+
+def _short_text(value: str, limit: int = 300) -> str:
+    normalized = " ".join(value.split())
+    return normalized if len(normalized) <= limit else f"{normalized[:limit - 1]}…"
+
+
+def _status_counts(items: list[RequirementOverviewItemResponse]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in items:
+        key = item.status.value
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _overview_response(row: ModuleOverview | None) -> ModuleOverviewResponse | None:
+    if row is None:
+        return None
+    keys = [item.get("requirement_key") for item in row.source_snapshot if isinstance(item, dict)]
+    return ModuleOverviewResponse(
+        overview=row.overview, core_capabilities=list(row.core_capabilities),
+        pending_items=list(row.pending_items), status=row.status, updated_at=row.updated_at,
+        referenced_requirement_keys=[item for item in keys if isinstance(item, str)],
+        last_error=row.last_error,
+    )

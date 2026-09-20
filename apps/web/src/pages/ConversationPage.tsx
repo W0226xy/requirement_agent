@@ -357,7 +357,9 @@ export function ConversationPage() {
       message_key: temporaryAssistantKey,
       sequence_number: Number.MAX_SAFE_INTEGER,
       role: "assistant",
-      content: "正在检索历史需求…",
+      content: /需求报告|报告|汇总|概述|统计|进展|风险汇总|当前会话/.test(rawText)
+        ? "正在生成需求报告…"
+        : "正在检索历史需求…",
       chat_status: "pending",
     };
     // Render first. The server, not the browser, determines whether this is a query.
@@ -397,8 +399,8 @@ export function ConversationPage() {
         ),
       );
       void message.success(
-        result.intent === "traceability_query"
-          ? "查询回答已加入会话"
+        result.intent === "traceability_query" || result.intent === "reporting_query"
+          ? (result.intent === "reporting_query" ? "需求报告正在生成" : "查询回答已加入会话")
           : result.replayed ? "该消息已提交，正在同步分析状态" : "需求已保存，AI 正在分析",
       );
       await Promise.all([
@@ -1103,9 +1105,11 @@ function ChatConversationTurn({
         {assistant ? <RobotOutlined /> : <UserOutlined />}
       </div>
       <div className={`chat-bubble ${assistant ? "assistant-bubble" : "user-bubble"}`}>
-        <Typography.Paragraph style={{ whiteSpace: "pre-wrap" }}>
-          {message.content}
-        </Typography.Paragraph>
+        {assistant ? <MarkdownChatText content={message.content} /> : (
+          <Typography.Paragraph style={{ whiteSpace: "pre-wrap" }}>
+            {message.content}
+          </Typography.Paragraph>
+        )}
         {!!message.tool_calls.length && (
           <Typography.Text type="secondary">
             已调用：{message.tool_calls.map((item) => item.tool_name).join("、")}
@@ -1126,6 +1130,22 @@ function ChatConversationTurn({
         )}
         <div className="chat-meta">{formatDate(message.created_at)}</div>
       </div>
+    </div>
+  );
+}
+
+function MarkdownChatText({ content }: { content: string }) {
+  return (
+    <div className="chat-markdown">
+      {content.split("\n").map((line, index) => {
+        if (line.startsWith("## ")) {
+          return <Typography.Title key={index} level={5}>{line.slice(3)}</Typography.Title>;
+        }
+        if (line.startsWith("- ")) {
+          return <div key={index}>• {line.slice(2)}</div>;
+        }
+        return line ? <Typography.Paragraph key={index}>{line}</Typography.Paragraph> : <br key={index} />;
+      })}
     </div>
   );
 }

@@ -14,11 +14,13 @@ from requirement_agent.application.ingestion.dispatcher import (
     ANALYZE_SOURCE_TASK,
     FEISHU_EVENT_TASK,
     INDEX_VERSION_TASK,
+    REFRESH_MODULE_OVERVIEW_TASK,
     PARSE_SOURCE_TASK,
     get_task_dispatcher,
 )
 from requirement_agent.application.ingestion.service import IngestionService
 from requirement_agent.application.versions.indexing import index_requirement_version
+from requirement_agent.application.module_overviews.service import ModuleOverviewService, Trigger
 from requirement_agent.connectors.feishu import (
     FeishuConnector,
     FeishuEventRequest,
@@ -226,6 +228,9 @@ def register_tasks(celery_app: Celery) -> None:#注册 Celery 任务
     def index_version_task(version_id: int) -> None:#正式需求向量化任务
         run_worker_coroutine(index_version(version_id))
 
+    def refresh_module_overview_task(module_name: str, requirement_key: str | None = None, version_number: int | None = None, change_type: str | None = None, change_reason: str | None = None) -> None:
+        run_worker_coroutine(refresh_module_overview(module_name, Trigger(requirement_key, version_number, change_type, change_reason)))
+
     def process_feishu_event_task(payload: dict[str, object]) -> None:#飞书事件处理任务
         run_worker_coroutine(process_feishu_event(payload))
 
@@ -244,6 +249,7 @@ def register_tasks(celery_app: Celery) -> None:#注册 Celery 任务
         retry_jitter=True,
         retry_kwargs={"max_retries": 3},
     )(index_version_task)
+    celery_app.task(name=REFRESH_MODULE_OVERVIEW_TASK)(refresh_module_overview_task)
     celery_app.task(
         name=FEISHU_EVENT_TASK,
         autoretry_for=(FeishuAPIError,),
@@ -277,6 +283,11 @@ async def analyze_source(source_record_id: int) -> None:
 async def index_version(version_id: int) -> None:#参数 version_id 是人工审核后提交形成的正式需求版本的 ID
     async with get_session_factory()() as session:#创建一个异步数据库会话，执行结束后自动关闭会话
         await index_requirement_version(session, get_embedding_model(), version_id)#将指定的正式需求版本加入长期 RAG 知识库
+
+
+async def refresh_module_overview(module_name: str, trigger: Trigger | None = None) -> None:
+    async with get_session_factory()() as session:
+        await ModuleOverviewService(session, get_llm()).refresh(module_name, trigger)
 
 
 async def process_feishu_event(payload: dict[str, object]) -> None:

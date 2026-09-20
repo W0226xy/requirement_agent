@@ -11,6 +11,7 @@ from requirement_agent.infrastructure.queue.celery import create_celery_app
 PARSE_SOURCE_TASK = "requirement_agent.sources.parse"#解析原始需求附件
 ANALYZE_SOURCE_TASK = "requirement_agent.sources.analyze"#对需求执行 AI 分析
 INDEX_VERSION_TASK = "requirement_agent.requirements.index_version"#审核通过后建立 RAG 向量索引
+REFRESH_MODULE_OVERVIEW_TASK = "requirement_agent.requirements.refresh_module_overview"
 FEISHU_EVENT_TASK = "requirement_agent.connectors.feishu.process_event"#异步处理飞书事件
 COMPACT_CONVERSATION_TASK = "requirement_agent.conversations.compact"#压缩会话上下文
 CHAT_QUERY_TASK = "requirement_agent.conversations.process_chat_query"
@@ -33,6 +34,9 @@ class TaskDispatcher(Protocol):#任务分发抽象接口
         ...
 
     def dispatch_version(self, version_id: int) -> None:#投递建立 RAG 向量索引任务。
+        ...
+
+    def dispatch_module_overview(self, module_name: str, trigger_requirement_key: str | None = None, trigger_version_number: int | None = None, change_type: str | None = None, change_reason: str | None = None) -> None:
         ...
 
     def dispatch_conversation_compaction(self, conversation_key: str) -> None:#投递会话压缩任务。
@@ -65,6 +69,9 @@ class CeleryTaskDispatcher:# Celery 任务分发器实现
     #Celery 将任务消息写入 Redis，Worker 取到任务后执行对应的 index_version_task
     def dispatch_version(self, version_id: int) -> None:
         self._celery_app.send_task(INDEX_VERSION_TASK, args=[version_id])
+
+    def dispatch_module_overview(self, module_name: str, trigger_requirement_key: str | None = None, trigger_version_number: int | None = None, change_type: str | None = None, change_reason: str | None = None) -> None:
+        self._celery_app.send_task(REFRESH_MODULE_OVERVIEW_TASK, args=[module_name, trigger_requirement_key, trigger_version_number, change_type, change_reason])
 
     def dispatch_conversation_compaction(self, conversation_key: str) -> None:#投递会话压缩任务
         self._celery_app.send_task(COMPACT_CONVERSATION_TASK, args=[conversation_key])

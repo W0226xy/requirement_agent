@@ -282,7 +282,7 @@ async def create_conversation_message(
             message=projected[0], assistant_message=projected[1], replayed=False,
             intent=intent.value,
         )
-    if intent == ConversationIntent.TRACEABILITY_QUERY:
+    if intent in (ConversationIntent.TRACEABILITY_QUERY, ConversationIntent.REPORTING_QUERY):
         started = perf_counter()
         logger.info("chat_query_submit_started conversation_key=%s", conversation_key)
         user_message = await service.add_chat_message(
@@ -291,7 +291,7 @@ async def create_conversation_message(
         logger.info("chat_query_user_persisted conversation_key=%s elapsed_ms=%d", conversation_key, round((perf_counter() - started) * 1000))
         assistant_message = await service.add_chat_message(
             conversation_key=conversation_key, owner_id=actor_id, role="assistant",
-            content="正在检索历史需求…", chat_status="pending",
+            content=("正在生成需求报告…" if intent == ConversationIntent.REPORTING_QUERY else "正在检索历史需求…"), chat_status="pending",
             reply_to_message_id=user_message.id,
         )
         logger.info("chat_query_placeholder_persisted conversation_key=%s elapsed_ms=%d", conversation_key, round((perf_counter() - started) * 1000))

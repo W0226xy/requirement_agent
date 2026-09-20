@@ -12,6 +12,8 @@ from requirement_agent.infrastructure.database.models.requirement import (
     Requirement,
     RequirementFeature,
     RequirementVersion,
+    ModuleOverview,
+    ModuleOverviewRevision,
 )
 from requirement_agent.infrastructure.database.models.review import ReviewTask
 from requirement_agent.infrastructure.database.models.source import SourceAttachment, SourceRecord
@@ -21,6 +23,8 @@ __all__ = [
     "AuditLog",
     "ConversationMessage",
     "FeatureLineage",
+    "ModuleOverview",
+    "ModuleOverviewRevision",
     "Requirement",
     "RequirementConversation",
     "RequirementEmbedding",

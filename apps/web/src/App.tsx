@@ -48,6 +48,9 @@ const RequirementsPage = lazy(() =>
     default: module.RequirementsPage,
   })),
 );
+const RequirementOverviewPage = lazy(() =>
+  import("./pages/RequirementOverviewPage").then((module) => ({ default: module.RequirementOverviewPage })),
+);
 const ReviewDetailPage = lazy(() =>
   import("./pages/ReviewDetailPage").then((module) => ({
     default: module.ReviewDetailPage,
@@ -71,6 +74,7 @@ const SourcesPage = lazy(() =>
 const navigation = [
   { key: "/chat", icon: <CommentOutlined />, label: "提出需求" },
   { key: "/requirements", icon: <UnorderedListOutlined />, label: "需求管理" },
+  { key: "/requirement-overview", icon: <ApartmentOutlined />, label: "需求总览" },
   { key: "/reviews", icon: <AuditOutlined />, label: "审核中心" },
   { key: "/sources", icon: <DatabaseOutlined />, label: "原始输入" },
   { key: "/search", icon: <SearchOutlined />, label: "综合检索" },
@@ -141,6 +145,7 @@ function ManagementApp() {
                 <Route path="/chat" element={<ConversationPage />} />
                 <Route path="/chat/:conversationKey" element={<ConversationPage />} />
                 <Route path="/requirements" element={<RequirementsPage />} />
+                <Route path="/requirement-overview" element={<RequirementOverviewPage />} />
                 <Route path="/requirements/:id" element={<RequirementDetailPage />} />
                 <Route path="/reviews" element={<ReviewsPage />} />
                 <Route path="/reviews/:id" element={<ReviewDetailPage />} />

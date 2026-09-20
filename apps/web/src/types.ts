@@ -113,6 +113,38 @@ export type Requirement = {
   features: RequirementFeature[];
 };
 
+export type RequirementOverviewItem = {
+  id: number;
+  requirement_key: string;
+  title: string;
+  description: string;
+  status: string;
+  source_record_id: number | null;
+};
+
+export type RequirementOverviewModule = {
+  name: string;
+  requirement_count: number;
+  status_counts: Record<string, number>;
+  requirements: RequirementOverviewItem[];
+  module_overview: ModuleOverviewData | null;
+};
+
+export type ModuleOverviewData = {
+  overview: string | null;
+  core_capabilities: string[];
+  pending_items: string[];
+  status: "ready" | "updating" | "failed" | "empty";
+  updated_at: string | null;
+  referenced_requirement_keys: string[];
+  last_error: string | null;
+};
+
+export type RequirementOverview = {
+  total_requirements: number;
+  modules: RequirementOverviewModule[];
+};
+
 export type RequirementVersion = {
   id: number;
   requirement_id: number;

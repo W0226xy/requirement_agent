@@ -18,6 +18,7 @@ from requirement_agent.application.ingestion.dispatcher import (
     get_task_dispatcher,
 )
 from requirement_agent.application.versions.service import VersionCommitService
+from requirement_agent.infrastructure.database.models import RequirementVersion
 from requirement_agent.infrastructure.database.models import (
     AuditLog,
     ReviewTask,
@@ -99,6 +100,19 @@ async def approve_review(
         comment=payload.comment,
     )
     dispatcher.dispatch_version(version.id)
+    # This runs only after the formal version transaction has committed. Include old
+    # modules as well, so deleting or moving the last feature cannot leave stale text.
+    modules = set(version.requirement_snapshot.get("functional_modules", []))
+    if version.parent_version_id is not None:
+        parent = await session.get(RequirementVersion, version.parent_version_id)
+        if parent is not None:
+            modules.update(parent.requirement_snapshot.get("functional_modules", []))
+    dispatch_module_overview = getattr(dispatcher, "dispatch_module_overview", None)
+    # Kept tolerant for old in-process dispatchers used by integrations during a
+    # rolling deploy; the production Celery dispatcher always exposes this method.
+    if callable(dispatch_module_overview):
+        for module_name in sorted(item for item in modules if isinstance(item, str) and item):
+            dispatch_module_overview(module_name, version.requirement_snapshot.get("requirement_key") if isinstance(version.requirement_snapshot.get("requirement_key"), str) else None, version.version_number, version.change_type.value, version.change_reason)
     return ApprovalResponse(
         review_task_id=review_task_id,
         requirement_id=version.requirement_id,

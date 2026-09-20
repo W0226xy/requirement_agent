@@ -60,6 +60,54 @@ class RequirementModuleListResponse(BaseModel):
     items: list[str]
 
 
+class RequirementOverviewItemResponse(BaseModel):
+    id: int
+    requirement_key: str
+    title: str
+    description: str
+    status: RequirementStatus
+    source_record_id: int | None = None
+
+
+class RequirementOverviewModuleResponse(BaseModel):
+    name: str
+    requirement_count: int
+    status_counts: dict[str, int]
+    requirements: list[RequirementOverviewItemResponse]
+    module_overview: "ModuleOverviewResponse | None" = None
+
+
+class ModuleOverviewResponse(BaseModel):
+    overview: str | None = None
+    core_capabilities: list[str] = Field(default_factory=list)
+    pending_items: list[str] = Field(default_factory=list)
+    status: str
+    updated_at: datetime | None = None
+    referenced_requirement_keys: list[str] = Field(default_factory=list)
+    last_error: str | None = None
+
+
+class ModuleOverviewRevisionResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    overview: str
+    core_capabilities: list[str]
+    pending_items: list[str]
+    source_snapshot: list[dict[str, object]]
+    source_fingerprint: str
+    trigger_requirement_key: str | None
+    trigger_version_number: int | None
+    created_at: datetime
+
+
+class ModuleOverviewHistoryResponse(BaseModel):
+    items: list[ModuleOverviewRevisionResponse]
+
+
+class RequirementOverviewResponse(BaseModel):
+    total_requirements: int
+    modules: list[RequirementOverviewModuleResponse]
+
+
 class RequirementVersionResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

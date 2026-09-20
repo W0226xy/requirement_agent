@@ -205,3 +205,40 @@ class FeatureLineage(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+class ModuleOverview(Base):
+    __tablename__ = "module_overview"
+
+    id: Mapped[int] = mapped_column(BIGINT_PK, primary_key=True, autoincrement=True)
+    module_name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    overview: Mapped[str | None] = mapped_column(Text)
+    core_capabilities: Mapped[list[str]] = mapped_column(JSON_DATA, nullable=False, default=list)
+    pending_items: Mapped[list[str]] = mapped_column(JSON_DATA, nullable=False, default=list)
+    requirement_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    source_snapshot: Mapped[list[dict[str, object]]] = mapped_column(JSON_DATA, nullable=False, default=list)
+    source_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="updating")
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    revisions: Mapped[list["ModuleOverviewRevision"]] = relationship(back_populates="module_overview")
+
+
+class ModuleOverviewRevision(Base):
+    __tablename__ = "module_overview_revision"
+    __table_args__ = (Index("ix_module_overview_revision_overview_id", "module_overview_id"),)
+
+    id: Mapped[int] = mapped_column(BIGINT_PK, primary_key=True, autoincrement=True)
+    module_overview_id: Mapped[int] = mapped_column(BIGINT_FK, ForeignKey("module_overview.id", ondelete="RESTRICT"), nullable=False)
+    overview: Mapped[str] = mapped_column(Text, nullable=False)
+    core_capabilities: Mapped[list[str]] = mapped_column(JSON_DATA, nullable=False)
+    pending_items: Mapped[list[str]] = mapped_column(JSON_DATA, nullable=False)
+    source_snapshot: Mapped[list[dict[str, object]]] = mapped_column(JSON_DATA, nullable=False)
+    source_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    trigger_requirement_key: Mapped[str | None] = mapped_column(String(64))
+    trigger_version_number: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    module_overview: Mapped[ModuleOverview] = relationship(back_populates="revisions")

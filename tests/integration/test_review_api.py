@@ -12,7 +12,9 @@ from requirement_agent.application.ingestion.dispatcher import get_task_dispatch
 from requirement_agent.infrastructure.database.base import Base
 from requirement_agent.infrastructure.database.models import (
     AnalysisResult,
+    FeatureLineage,
     Requirement,
+    RequirementFeature,
     RequirementVersion,
     ReviewTask,
     SourceRecord,
@@ -24,6 +26,7 @@ from requirement_agent.shared.enums import (
     ProcessingStatus,
     RequirementChangeType,
     RequirementStatus,
+    LineageOperationType,
     ReviewStatus,
 )
 
@@ -459,3 +462,61 @@ async def test_list_requirements_filters_by_functional_module_in_database(
     ]
     assert modules.status_code == 200
     assert modules.json() == {"items": ["播放列表", "视频播放器", "音乐播放器"]}
+
+
+async def test_requirement_overview_groups_current_formal_versions_and_filters(
+    review_api_client: tuple[TestClient, RecordingDispatcher, async_sessionmaker[AsyncSession]],
+) -> None:
+    client, _, session_factory = review_api_client
+    async with session_factory() as session:
+        source = await session.scalar(select(SourceRecord))
+        assert source is not None
+        records: list[tuple[Requirement, list[str], str, RequirementStatus]] = [
+            (Requirement(requirement_key="REQ-OVERVIEW-1", title="播放列表", status=RequirementStatus.ACTIVE,
+                functional_modules=["音乐", "播放"], extra_fields={}), ["音乐"], "支持创建播放列表", RequirementStatus.ACTIVE),
+            (Requirement(requirement_key="REQ-OVERVIEW-2", title="下载管理", status=RequirementStatus.ARCHIVED,
+                functional_modules=["音乐"], extra_fields={}), ["下载"], "支持离线下载", RequirementStatus.ARCHIVED),
+            (Requirement(requirement_key="REQ-OVERVIEW-3", title="未分类需求", status=RequirementStatus.ACTIVE,
+                functional_modules=[], extra_fields={}), [], "没有模块", RequirementStatus.ACTIVE),
+        ]
+        for index, (requirement, feature_modules, description, _) in enumerate(records, start=1):
+            session.add(requirement); await session.flush()
+            version = RequirementVersion(requirement_id=requirement.id, version_number=1,
+                change_type=RequirementChangeType.INITIAL, version_title=requirement.title,
+                requirement_snapshot={"description": description}, diff_snapshot={}, change_reason="initial",
+                created_by="user-1", reviewed_by="user-1")
+            session.add(version); await session.flush()
+            requirement.current_version_id = version.id
+            for feature_index, feature_module in enumerate(feature_modules, start=1):
+                feature = RequirementFeature(feature_key=f"F-OVERVIEW-{index}-{feature_index}", version_id=version.id,
+                    module=feature_module, feature_title="功能", feature_description=description,
+                    acceptance_criteria=[], feature_status="active", sort_order=feature_index)
+                session.add(feature)
+            session.add(FeatureLineage(feature_key=f"F-OVERVIEW-{index}-1", source_record_id=source.id,
+                introduced_version_id=version.id, operation_type=LineageOperationType.INTRODUCED, evidence_text="证据"))
+        await session.commit()
+
+    overview = client.get("/api/v1/requirements/overview")
+    music = client.get("/api/v1/requirements/overview", params={"module": "音乐"})
+    keyword = client.get("/api/v1/requirements/overview", params={"keyword": "离线下载"})
+    status = client.get("/api/v1/requirements/overview", params={"status": "archived"})
+
+    assert overview.status_code == 200
+    groups = {item["name"]: item for item in overview.json()["modules"]}
+    assert overview.json()["total_requirements"] == 3
+    assert groups["音乐"]["requirement_count"] == 2
+    assert groups["音乐"]["status_counts"] == {"active": 1, "archived": 1}
+    assert groups["播放"]["requirements"][0]["requirement_key"] == "REQ-OVERVIEW-1"
+    assert groups["未分类"]["requirements"][0]["requirement_key"] == "REQ-OVERVIEW-3"
+    assert music.json()["total_requirements"] == 2
+    assert keyword.json()["modules"][0]["requirements"][0]["requirement_key"] == "REQ-OVERVIEW-2"
+    assert status.json()["total_requirements"] == 1
+
+
+async def test_requirement_overview_returns_empty_successfully_without_formal_requirements(
+    review_api_client: tuple[TestClient, RecordingDispatcher, async_sessionmaker[AsyncSession]],
+) -> None:
+    client, _, _ = review_api_client
+    response = client.get("/api/v1/requirements/overview")
+    assert response.status_code == 200
+    assert response.json() == {"total_requirements": 0, "modules": []}

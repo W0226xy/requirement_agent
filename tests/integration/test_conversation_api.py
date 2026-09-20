@@ -24,6 +24,8 @@ class MemoryStorage:
 
 
 class RecordingDispatcher:
+    def __init__(self) -> None:
+        self.chat_queries: list[tuple[str, int, int, str]] = []
     def dispatch_source(self, source_record_id: int) -> None:
         pass
 
@@ -32,6 +34,12 @@ class RecordingDispatcher:
 
     def dispatch_version(self, version_id: int) -> None:
         pass
+
+    def dispatch_conversation_compaction(self, conversation_key: str) -> None:
+        pass
+
+    def dispatch_chat_query(self, conversation_key: str, user_message_id: int, assistant_message_id: int, actor_id: str) -> None:
+        self.chat_queries.append((conversation_key, user_message_id, assistant_message_id, actor_id))
 
 
 @pytest_asyncio.fixture
@@ -179,6 +187,19 @@ async def test_message_rejects_wrong_owner(conversation_client: TestClient) -> N
         },
     )
     assert response.status_code == 404
+
+
+async def test_reporting_message_is_accepted_quickly_and_queued(conversation_client: TestClient) -> None:
+    headers = {"X-Actor-ID": "owner-1", "Idempotency-Key": "report-query-0001"}
+    created = conversation_client.post("/api/v1/conversations", headers=headers)
+    response = conversation_client.post(
+        f"/api/v1/conversations/{created.json()['conversation_key']}/messages",
+        data={"raw_text": "生成当前需求库的需求报告"}, headers=headers,
+    )
+    assert response.status_code == 202
+    assert response.json()["intent"] == "reporting_query"
+    assert response.json()["assistant_message"]["content"] == "正在生成需求报告…"
+    assert response.json()["assistant_message"]["chat_status"] == "pending"
 
 
 async def test_clear_context_keeps_messages_and_sources(
