@@ -93,6 +93,21 @@ class GetRequirementReportSnapshotInput(ToolModel):
     limit: Annotated[int, Field(default=5, ge=1, le=20)] = 5
 
 
+class TavilySearchInput(ToolModel):
+    query: str = Field(min_length=1, max_length=1_000)
+    max_results: Annotated[int, Field(default=5, ge=1, le=10)] = 5
+    topic: Literal["general"] = "general"
+    search_depth: Literal["basic", "advanced", "fast", "ultra-fast"] = "basic"
+    time_range: Literal["day", "week", "month", "year"] | None = None
+    include_domains: list[str] = Field(default_factory=list, max_length=20)
+    exclude_domains: list[str] = Field(default_factory=list, max_length=20)
+
+
+class TavilyExtractInput(ToolModel):
+    urls: list[str] = Field(min_length=1, max_length=5)
+    extract_depth: Literal["basic", "advanced"] = "basic"
+
+
 class RequirementReportSnapshotOutput(ToolModel):
     scope: str
     generated_at: datetime

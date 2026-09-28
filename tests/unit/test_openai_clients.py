@@ -2,6 +2,7 @@ import json
 
 import httpx
 import pytest
+from pydantic import BaseModel
 
 from requirement_agent.ai.llm.openai_compatible import (
     OpenAICompatibleChatModel,
@@ -114,6 +115,34 @@ async def test_chat_parses_openai_tool_calls_and_sends_tool_definitions() -> Non
     assert response.tool_calls[0].name == "search_requirements"
     assert response.tool_calls[0].arguments == '{"query": "歌词"}'
     assert json.loads(requests[0].content)["tools"][0]["function"]["name"] == "search_requirements"
+
+
+async def test_chat_uses_json_schema_for_pydantic_structured_output() -> None:
+    class Classification(BaseModel):
+        intent: str
+        confidence: float
+        requires_web_search: bool
+
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps({
+            "intent": "general_query", "confidence": 0.9, "requires_web_search": True,
+        })}}]})
+
+    chat = OpenAICompatibleChatModel(
+        base_url="https://chat.example/v1", api_key="secret", model="chat-model",
+        timeout_seconds=10, max_tokens=512, transport=httpx.MockTransport(handler),
+    )
+    result = await chat.complete_structured(
+        [{"role": "user", "content": "今天的新闻"}], schema=Classification
+    )
+    payload = json.loads(requests[0].content)
+    assert result.requires_web_search is True
+    assert payload["temperature"] == 0.1
+    assert payload["response_format"]["type"] == "json_schema"
+    assert payload["response_format"]["json_schema"]["strict"] is True
 
 
 async def test_embedding_rejects_wrong_dimension() -> None:

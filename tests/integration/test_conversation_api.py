@@ -7,6 +7,12 @@ from sqlalchemy.pool import StaticPool
 
 from apps.api.main import app
 from requirement_agent.application.ingestion.dispatcher import get_task_dispatcher
+from requirement_agent.application.conversations.intent import (
+    IntentClassification,
+    ConversationIntent,
+    fallback_classify_conversation_message,
+)
+from requirement_agent.api.conversations import get_intent_classifier
 from requirement_agent.infrastructure.database.base import Base
 from requirement_agent.infrastructure.database.session import get_session
 from requirement_agent.infrastructure.storage.minio import get_object_storage
@@ -25,7 +31,7 @@ class MemoryStorage:
 
 class RecordingDispatcher:
     def __init__(self) -> None:
-        self.chat_queries: list[tuple[str, int, int, str]] = []
+        self.chat_queries: list[tuple[str, int, int, str, str, bool]] = []
     def dispatch_source(self, source_record_id: int) -> None:
         pass
 
@@ -38,8 +44,13 @@ class RecordingDispatcher:
     def dispatch_conversation_compaction(self, conversation_key: str) -> None:
         pass
 
-    def dispatch_chat_query(self, conversation_key: str, user_message_id: int, assistant_message_id: int, actor_id: str) -> None:
-        self.chat_queries.append((conversation_key, user_message_id, assistant_message_id, actor_id))
+    def dispatch_chat_query(self, conversation_key: str, user_message_id: int, assistant_message_id: int, actor_id: str, intent: str, requires_web_search: bool = False) -> None:
+        self.chat_queries.append((conversation_key, user_message_id, assistant_message_id, actor_id, intent, requires_web_search))
+
+
+class FallbackIntentClassifier:
+    async def classify(self, message: str, *, recent_context: list[dict[str, str]], has_attachment: bool) -> IntentClassification:
+        return fallback_classify_conversation_message(message, has_attachment=has_attachment)
 
 
 @pytest_asyncio.fixture
@@ -60,6 +71,7 @@ async def conversation_client() -> AsyncIterator[TestClient]:
     app.dependency_overrides[get_session] = override_session
     app.dependency_overrides[get_object_storage] = MemoryStorage
     app.dependency_overrides[get_task_dispatcher] = RecordingDispatcher
+    app.dependency_overrides[get_intent_classifier] = FallbackIntentClassifier
     try:
         yield TestClient(app)
     finally:
@@ -200,6 +212,38 @@ async def test_reporting_message_is_accepted_quickly_and_queued(conversation_cli
     assert response.json()["intent"] == "reporting_query"
     assert response.json()["assistant_message"]["content"] == "正在生成需求报告…"
     assert response.json()["assistant_message"]["chat_status"] == "pending"
+
+
+async def test_general_message_creates_only_chat_messages_and_is_queued(
+    conversation_client: TestClient,
+) -> None:
+    headers = {"X-Actor-ID": "owner-1", "Idempotency-Key": "general-query-0001"}
+    created = conversation_client.post("/api/v1/conversations", headers=headers)
+    key = created.json()["conversation_key"]
+    response = conversation_client.post(
+        f"/api/v1/conversations/{key}/messages",
+        data={"raw_text": "PostgreSQL GIN 是什么？"},
+        headers=headers,
+    )
+    messages = conversation_client.get(f"/api/v1/conversations/{key}/messages", headers=headers)
+    assert response.status_code == 202
+    assert response.json()["intent"] == ConversationIntent.GENERAL_QUERY.value
+    assert response.json()["message"]["source"] is None
+    assert response.json()["assistant_message"]["chat_status"] == "pending"
+    assert messages.json()["total"] == 2
+
+
+async def test_current_news_is_general_and_requests_web_search(
+    conversation_client: TestClient,
+) -> None:
+    headers = {"X-Actor-ID": "owner-1", "Idempotency-Key": "news-query-0001"}
+    created = conversation_client.post("/api/v1/conversations", headers=headers)
+    response = conversation_client.post(
+        f"/api/v1/conversations/{created.json()['conversation_key']}/messages",
+        data={"raw_text": "今天有哪些 AI 新闻？"}, headers=headers,
+    )
+    assert response.status_code == 202
+    assert response.json()["intent"] == ConversationIntent.GENERAL_QUERY.value
 
 
 async def test_clear_context_keeps_messages_and_sources(

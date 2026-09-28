@@ -22,9 +22,11 @@ class FakeChat:
         self.responses = responses
         self.unsupported = unsupported
         self.calls = 0
+        self.messages: list[list[dict[str, object]]] = []
 
     async def complete_with_tools(self, messages: list[dict[str, object]], *, tools: list[dict[str, object]]) -> ToolChatResponse:
         self.calls += 1
+        self.messages.append(messages)
         if self.unsupported:
             raise NotImplementedError
         return self.responses.pop(0)
@@ -36,6 +38,9 @@ class FakeChat:
 class FakeTools:
     async def search_requirements(self, value: Any) -> SearchRequirementsOutput:
         return SearchRequirementsOutput(items=[])
+
+    async def tavily_search(self, value: Any) -> dict[str, object]:
+        return {"results": [{"title": "AI News", "url": "https://example.test/news"}]}
 
 
 class FailingTools:
@@ -128,3 +133,24 @@ async def test_reporting_skill_rejects_tools_outside_its_read_only_whitelist() -
     _, calls, _ = await agent.answer("生成需求报告")
     assert calls[0]["ok"] is False
     assert "search_requirements" not in get_skill("requirement_reporting").allowed_tools
+
+
+async def test_general_skill_keeps_tavily_urls_as_web_references_and_history() -> None:
+    chat = FakeChat([
+        ToolChatResponse(tool_calls=[ToolCall(
+            id="1", name="tavily_search", arguments='{"query":"AI news", "topic":"general"}'
+        )]),
+        ToolChatResponse(content="这是今天的 AI 新闻。"),
+    ])
+    agent = ChatAgentService(
+        DummySession(), chat, FakeTools(), "user-1", "CONV-1", get_skill("general_assistant")
+    )  # type: ignore[arg-type]
+    answer, _, references = await agent.answer(
+        "今天有哪些 AI 新闻？", history=[{"role": "user", "content": "LangGraph 是什么？"}]
+    )
+    assert answer == "这是今天的 AI 新闻。"
+    assert references == [{
+        "type": "web", "id": "https://example.test/news", "url": "https://example.test/news", "title": "AI News"
+    }]
+    assert chat.messages[0][1] == {"role": "user", "content": "LangGraph 是什么？"}
+    assert chat.responses == []

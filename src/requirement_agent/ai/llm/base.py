@@ -1,6 +1,9 @@
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 from pydantic import BaseModel
+
+
+SchemaT = TypeVar("SchemaT", bound=BaseModel)
 
 
 class ToolCall(BaseModel):
@@ -30,6 +33,15 @@ class ChatModel(Protocol):
     async def complete_with_tools(
         self, messages: list[dict[str, object]], *, tools: list[dict[str, object]]
     ) -> ToolChatResponse:
+        ...
+
+    async def complete_structured(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        schema: type[SchemaT],
+        temperature: float = 0.1,
+    ) -> SchemaT:
         ...
 
 

@@ -359,7 +359,7 @@ export function ConversationPage() {
       role: "assistant",
       content: /需求报告|报告|汇总|概述|统计|进展|风险汇总|当前会话/.test(rawText)
         ? "正在生成需求报告…"
-        : "正在检索历史需求…",
+        : "正在处理…",
       chat_status: "pending",
     };
     // Render first. The server, not the browser, determines whether this is a query.
@@ -399,7 +399,7 @@ export function ConversationPage() {
         ),
       );
       void message.success(
-        result.intent === "traceability_query" || result.intent === "reporting_query"
+        ["traceability_query", "reporting_query", "general_query", "clarification"].includes(result.intent)
           ? (result.intent === "reporting_query" ? "需求报告正在生成" : "查询回答已加入会话")
           : result.replayed ? "该消息已提交，正在同步分析状态" : "需求已保存，AI 正在分析",
       );
@@ -750,11 +750,17 @@ export function ConversationPage() {
                 }} />
             ) : (
               <ChatConversationTurn key={item.message_key} message={item}
-                onReference={(reference) => navigate(
-                  reference.type === "source"
-                    ? `/sources/${encodeURIComponent(String(reference.id))}`
-                    : `/requirements?requirement_key=${encodeURIComponent(String(reference.id))}`,
-                )} />
+                onReference={(reference) => {
+                  if (reference.type === "web") {
+                    window.open(String(reference.url ?? reference.id), "_blank", "noopener,noreferrer");
+                    return;
+                  }
+                  navigate(
+                    reference.type === "source"
+                      ? `/sources/${encodeURIComponent(String(reference.id))}`
+                      : `/requirements?requirement_key=${encodeURIComponent(String(reference.id))}`,
+                  );
+                }} />
             ))
           )}
         </div>
@@ -1123,7 +1129,7 @@ function ChatConversationTurn({
                 size="small"
                 onClick={() => onReference(reference)}
               >
-                {reference.type === "source" ? "来源" : "需求"}：{String(reference.id)}
+                {reference.type === "source" ? "来源" : reference.type === "web" ? "网页" : "需求"}：{String(reference.title ?? reference.id)}
               </Button>
             ))}
           </Space>

@@ -203,6 +203,43 @@ class ConversationService:
         await self._session.refresh(message)
         return message
 
+    async def recent_chat_context(
+        self,
+        *,
+        conversation_key: str,
+        owner_id: str,
+        before_sequence: int | None = None,
+        limit: int = 6,
+    ) -> list[dict[str, str]]:
+        """Return a small conversational window only; it intentionally never uses RAG."""
+        conversation = await self.get(conversation_key, owner_id)
+        conditions = [ConversationMessage.conversation_id == conversation.id]
+        if before_sequence is not None:
+            conditions.append(ConversationMessage.sequence_number < before_sequence)
+        messages = list(
+            (
+                await self._session.execute(
+                    select(ConversationMessage)
+                    .options(selectinload(ConversationMessage.source_record))
+                    .where(*conditions)
+                    .order_by(ConversationMessage.sequence_number.desc())
+                    .limit(limit)
+                )
+            ).scalars()
+        )
+        return [
+            {
+                "role": message.role,
+                "content": (
+                    message.source_record.raw_text
+                    if message.source_record is not None
+                    else message.content
+                )[:2_000],
+            }
+            for message in reversed(messages)
+            if message.role in {"user", "assistant"}
+        ]
+
     async def load_message(
         self,
         conversation_key: str,

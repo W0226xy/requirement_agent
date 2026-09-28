@@ -49,6 +49,13 @@ class Settings(BaseSettings):
     llm_max_completion_tokens: int = Field(default=4096, ge=256, le=32_768)
     llm_max_retries: int = Field(default=2, ge=0, le=2)
 
+    # Tavily is reached only through its hosted MCP server.  Keep the key out of
+    # the URL so it is not accidentally emitted by HTTP or application logs.
+    tavily_mcp_enabled: bool = False
+    tavily_mcp_url: str = "https://mcp.tavily.com/mcp/"
+    tavily_api_key: SecretStr = SecretStr("")
+    tavily_mcp_timeout_seconds: float = Field(default=60, gt=0, le=120)
+
     retrieval_keyword_weight: float = Field(default=0.4, ge=0, le=1)
     retrieval_vector_weight: float = Field(default=0.4, ge=0, le=1)
     retrieval_business_weight: float = Field(default=0.2, ge=0, le=1)

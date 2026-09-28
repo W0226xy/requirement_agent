@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+from collections.abc import Mapping
 from time import perf_counter
 
 from pydantic import ValidationError
@@ -11,7 +12,6 @@ from requirement_agent.ai.llm.base import ChatModel
 from requirement_agent.ai.skills import AgentSkill, get_skill
 from requirement_agent.ai.tools import TOOL_BY_NAME, openai_tools
 from requirement_agent.ai.tools.schemas import ToolExecutionResult
-from requirement_agent.application.chat_tools import ChatToolService
 from requirement_agent.infrastructure.database.models import AuditLog
 from requirement_agent.shared.enums import AuditActionType, AuditEntityType
 from requirement_agent.shared.errors import LLMServiceError
@@ -23,19 +23,31 @@ TOOL_TIMEOUT_SECONDS = 15
 
 class ChatAgentService:
     #初始化：绑定当前会话、用户和 Skill
-    def __init__(self, session: AsyncSession, chat_model: ChatModel, tool_service: ChatToolService,
-                 actor_id: str, conversation_key: str, skill: AgentSkill | None = None) -> None:
+    def __init__(self, session: AsyncSession | None, chat_model: ChatModel, tool_service: object,
+                 actor_id: str, conversation_key: str, skill: AgentSkill | None = None,
+                 audit_tools: bool = True) -> None:
         self._session, self._chat_model, self._tools = session, chat_model, tool_service#数据库会话
         self._actor_id, self._conversation_key = actor_id, conversation_key#当前用户，用于权限和审计
         self._skill = skill or get_skill()#当前任务的 Skill；
+        self._audit_tools = audit_tools
 
-    async def answer(self, user_message: str) -> tuple[str, list[dict[str, object]], list[dict[str, object]]]:
+    async def answer(
+        self,
+        user_message: str,
+        *,
+        history: list[dict[str, str]] | None = None,
+        additional_system_instruction: str = "",
+    ) -> tuple[str, list[dict[str, object]], list[dict[str, object]]]:
         messages: list[dict[str, object]] = [
             #一开始构造两条消息system_prompt、output_constraints和当前会话的 conversation_key，作为系统消息；
             # 然后把用户消息作为用户消息
-            {"role": "system", "content": f"{self._skill.system_prompt}\n{self._skill.output_constraints}\n当前会话 conversation_key：{self._conversation_key}"},
-            {"role": "user", "content": user_message},
+            {"role": "system", "content": f"{self._skill.system_prompt}\n{self._skill.output_constraints}\n{additional_system_instruction}\n当前会话 conversation_key：{self._conversation_key}"},
         ]
+        messages.extend(
+            {"role": item["role"], "content": item["content"]}
+            for item in history or []
+        )
+        messages.append({"role": "user", "content": user_message})
         summaries: list[dict[str, object]] = []
         try:
             for _ in range(MAX_TOOL_ROUNDS):#最多3轮工具调用，超过三轮仍未回答，就返回
@@ -70,9 +82,12 @@ class ChatAgentService:
         except (LLMServiceError, NotImplementedError) as exc:
             logger.info("chat_tool_call_unavailable conversation=%s error_type=%s", self._conversation_key, type(exc).__name__)
             # Preserve availability for providers without tool support.  This is intentionally plain text.
-            return await self._chat_model.complete([
-                {"role": "system", "content": self._skill.system_prompt}, {"role": "user", "content": user_message}
-            ], analysis_type="conversation_summary"), summaries, _references(summaries)
+            fallback_messages = [{"role": "system", "content": self._skill.system_prompt}]
+            fallback_messages.extend(history or [])
+            fallback_messages.append({"role": "user", "content": user_message})
+            return await self._chat_model.complete(
+                fallback_messages, analysis_type="conversation_summary"
+            ), summaries, _references(summaries)
 
     #Function Call 最关键的保护部分。
     async def _execute(self, name: str, raw_arguments: str) -> ToolExecutionResult:
@@ -94,17 +109,29 @@ class ChatAgentService:
                 result = ToolExecutionResult(ok=False, error={"code": "invalid_arguments", "message": "工具参数不合法"})
                 return result
             method = getattr(self._tools, name)
-            data = await asyncio.wait_for(method(value), timeout=TOOL_TIMEOUT_SECONDS)
+            timeout_seconds = getattr(self._tools, "tool_timeout_seconds", TOOL_TIMEOUT_SECONDS)
+            data = await asyncio.wait_for(method(value), timeout=timeout_seconds)
             if data is None:
                 result = ToolExecutionResult(ok=False, error={"code": "not_found", "message": "未找到该业务数据或无权访问"})
                 return result
-            result = ToolExecutionResult(ok=True, data=data.model_dump(mode="json"))
+            serialized = data.model_dump(mode="json") if hasattr(data, "model_dump") else data
+            if not isinstance(serialized, Mapping):
+                raise TypeError("tool result must be a mapping")
+            result = ToolExecutionResult(ok=True, data=dict(serialized))
             return result
         except TimeoutError:
             result = ToolExecutionResult(ok=False, error={"code": "timeout", "message": "查询超时，请缩小范围后重试"})
             return result
-        except Exception:
-            logger.exception("chat_tool_execution_failed tool=%s", name)
+        except Exception as exc:
+            logger.exception(
+                "chat_tool_execution_failed tool=%s exception_type=%s "
+                "exception_message=%s mcp_status_code=%s mcp_response=%r",
+                name,
+                type(exc).__name__,
+                str(exc)[:1_000],
+                getattr(exc, "status_code", None),
+                getattr(exc, "response_body", None),
+            )
             result = ToolExecutionResult(ok=False, error={"code": "tool_failed", "message": "查询暂时不可用"})
             return result
         finally:
@@ -112,6 +139,8 @@ class ChatAgentService:
 
     async def _audit(self, name: str, parameters: dict[str, object], started: float,
                      result: ToolExecutionResult | None) -> None:
+        if not self._audit_tools or self._session is None:
+            return
         try:
             self._session.add(AuditLog(
                 actor_id=self._actor_id,
@@ -138,7 +167,8 @@ def _redact(value: dict[str, object]) -> dict[str, object]:
 def _result_summary(result: ToolExecutionResult) -> str:
     if not result.ok: return result.error.message if result.error else "查询失败"
     data = result.data or {}
-    return f"已返回 {len(data.get('items', []))} 条结果" if "items" in data else "查询完成"
+    items = data.get("items")
+    return f"已返回 {len(items)} 条结果" if isinstance(items, list) else "查询完成"
 
 
 def _references(summaries: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -176,10 +206,20 @@ def _result_references(result: ToolExecutionResult) -> list[dict[str, object]]:
         for item in items:
             if isinstance(item, dict) and isinstance(item.get("requirement_key"), str):
                 references.append({"type": "requirement", "id": item["requirement_key"]})
-    for source_id in data.get("source_record_ids", []):
+    source_record_ids = data.get("source_record_ids")
+    for source_id in source_record_ids if isinstance(source_record_ids, list) else []:
         if isinstance(source_id, int):
             references.append({"type": "source", "id": str(source_id)})
-    for reference in data.get("references", []):
+    stored_references = data.get("references")
+    for reference in stored_references if isinstance(stored_references, list) else []:
         if isinstance(reference, dict) and isinstance(reference.get("type"), str) and isinstance(reference.get("id"), str):
             references.append({"type": reference["type"], "id": reference["id"]})
+    results = data.get("results")
+    for item in results if isinstance(results, list) else []:
+        if not isinstance(item, dict) or not isinstance(item.get("url"), str):
+            continue
+        reference: dict[str, object] = {"type": "web", "id": item["url"], "url": item["url"]}
+        if isinstance(item.get("title"), str):
+            reference["title"] = item["title"]
+        references.append(reference)
     return references

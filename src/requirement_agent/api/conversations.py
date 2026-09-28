@@ -40,8 +40,10 @@ from requirement_agent.api.schemas.sources import SourceRecordResponse
 from requirement_agent.application.conversations import ConversationService
 from requirement_agent.application.conversations.intent import (
     ConversationIntent,
-    classify_conversation_message,
+    IntentClassifier,
 )
+from requirement_agent.application.general_assistant import GeneralAssistantService
+from requirement_agent.infrastructure.tavily_mcp import TavilyMCPClient
 from requirement_agent.application.ingestion.dispatcher import (
     TaskDispatcher,
     get_task_dispatcher,
@@ -69,6 +71,10 @@ def _service(
     ingestion_service: IngestionService,
 ) -> ConversationService:
     return ConversationService(session, ingestion_service)
+
+
+def get_intent_classifier() -> IntentClassifier:
+    return IntentClassifier(get_llm())
 
 
 @router.post("", response_model=ConversationResponse, status_code=status.HTTP_201_CREATED)
@@ -183,10 +189,31 @@ async def query_conversation_agent(
     actor_id: Annotated[str, Depends(get_actor_id)],
     session: Annotated[AsyncSession, Depends(get_session)],
     ingestion_service: Annotated[IngestionService, Depends(get_ingestion_service)],
+    intent_classifier: Annotated[IntentClassifier, Depends(get_intent_classifier)],
 ) -> ChatQueryResponse:
     """Read-only Q&A endpoint; it never creates a SourceRecord or dispatches Celery."""
-    await _service(session, ingestion_service).get(conversation_key, actor_id)
+    service = _service(session, ingestion_service)
+    await service.get(conversation_key, actor_id)
     settings = get_settings()
+    classification = await intent_classifier.classify(
+        payload.message,
+        recent_context=await service.recent_chat_context(
+            conversation_key=conversation_key, owner_id=actor_id
+        ),
+        has_attachment=False,
+    )
+    if classification.intent == ConversationIntent.GENERAL_QUERY:
+        answer, tool_calls, references = await GeneralAssistantService(
+            get_llm(), TavilyMCPClient(settings), conversation_key=conversation_key,
+            tool_timeout_seconds=settings.tavily_mcp_timeout_seconds,
+        ).answer(
+            payload.message,
+            history=await service.recent_chat_context(
+                conversation_key=conversation_key, owner_id=actor_id
+            ),
+            requires_web_search=classification.requires_web_search,
+        )
+        return ChatQueryResponse(answer=answer, tool_calls=tool_calls, references=references)
     retriever = HybridRetriever(session, get_embedding_model(), RetrievalWeights(
         keyword=settings.retrieval_keyword_weight, vector=settings.retrieval_vector_weight,
         business=settings.retrieval_business_weight), candidate_limit=settings.retrieval_candidate_limit,
@@ -252,6 +279,7 @@ async def create_conversation_message(
     session: Annotated[AsyncSession, Depends(get_session)],
     ingestion_service: Annotated[IngestionService, Depends(get_ingestion_service)],
     dispatcher: Annotated[TaskDispatcher, Depends(get_task_dispatcher)],
+    intent_classifier: Annotated[IntentClassifier, Depends(get_intent_classifier)],
     idempotency_key: Annotated[
         str,
         Header(alias="Idempotency-Key", min_length=8, max_length=255),
@@ -267,22 +295,20 @@ async def create_conversation_message(
 
         raise ConnectorVerificationError("a message requires raw_text or a file")
     service = _service(session, ingestion_service)
-    intent = classify_conversation_message(text, has_attachment=attachment is not None)
-    if intent == ConversationIntent.CLARIFICATION:
-        user_message = await service.add_chat_message(
-            conversation_key=conversation_key, owner_id=actor_id, role="user", content=text
-        )
-        assistant_message = await service.add_chat_message(
-            conversation_key=conversation_key, owner_id=actor_id, role="assistant",
-            content="请说明这是新需求，还是要查询历史需求、来源或当前会话内容。",
-        )
-        projected = await _project_messages(session, [user_message, assistant_message])
-        response.status_code = status.HTTP_200_OK
-        return CreateConversationMessageResponse(
-            message=projected[0], assistant_message=projected[1], replayed=False,
-            intent=intent.value,
-        )
-    if intent in (ConversationIntent.TRACEABILITY_QUERY, ConversationIntent.REPORTING_QUERY):
+    classification = await intent_classifier.classify(
+        text,
+        recent_context=await service.recent_chat_context(
+            conversation_key=conversation_key, owner_id=actor_id
+        ),
+        has_attachment=attachment is not None,
+    )
+    intent = classification.intent
+    if intent in (
+        ConversationIntent.TRACEABILITY_QUERY,
+        ConversationIntent.REPORTING_QUERY,
+        ConversationIntent.CLARIFICATION,
+        ConversationIntent.GENERAL_QUERY,
+    ):
         started = perf_counter()
         logger.info("chat_query_submit_started conversation_key=%s", conversation_key)
         user_message = await service.add_chat_message(
@@ -291,13 +317,14 @@ async def create_conversation_message(
         logger.info("chat_query_user_persisted conversation_key=%s elapsed_ms=%d", conversation_key, round((perf_counter() - started) * 1000))
         assistant_message = await service.add_chat_message(
             conversation_key=conversation_key, owner_id=actor_id, role="assistant",
-            content=("正在生成需求报告…" if intent == ConversationIntent.REPORTING_QUERY else "正在检索历史需求…"), chat_status="pending",
+            content=_pending_message(intent), chat_status="pending",
             reply_to_message_id=user_message.id,
         )
         logger.info("chat_query_placeholder_persisted conversation_key=%s elapsed_ms=%d", conversation_key, round((perf_counter() - started) * 1000))
         try:
             dispatcher.dispatch_chat_query(
-                conversation_key, user_message.id, assistant_message.id, actor_id
+                conversation_key, user_message.id, assistant_message.id, actor_id,
+                intent.value, classification.requires_web_search,
             )
             logger.info("chat_query_task_dispatched conversation_key=%s elapsed_ms=%d", conversation_key, round((perf_counter() - started) * 1000))
         except Exception:
@@ -339,6 +366,16 @@ async def create_conversation_message(
         replayed=result.replayed,
         intent=intent.value,
     )
+
+
+def _pending_message(intent: ConversationIntent) -> str:
+    if intent == ConversationIntent.REPORTING_QUERY:
+        return "正在生成需求报告…"
+    if intent == ConversationIntent.TRACEABILITY_QUERY:
+        return "正在检索历史需求…"
+    if intent == ConversationIntent.GENERAL_QUERY:
+        return "正在思考…"
+    return "正在结合会话上下文回答…"
 
 
 @router.post(

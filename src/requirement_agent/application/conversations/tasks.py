@@ -3,6 +3,8 @@ import logging
 
 from celery import Celery
 from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from requirement_agent.ai.llm.factory import get_llm
 from requirement_agent.application.conversations.memory import compact_conversation
@@ -12,9 +14,11 @@ from requirement_agent.ai.llm.factory import get_embedding_model
 from requirement_agent.ai.retrieval.hybrid import HybridRetriever, RetrievalWeights
 from requirement_agent.application.chat_agent import ChatAgentService
 from requirement_agent.ai.skills import get_skill
-from requirement_agent.application.conversations.intent import ConversationIntent, classify_conversation_message
+from requirement_agent.application.conversations.intent import ConversationIntent
 from requirement_agent.application.chat_tools import ChatToolService
+from requirement_agent.application.general_assistant import GeneralAssistantService
 from requirement_agent.infrastructure.database.models import ConversationMessage
+from requirement_agent.infrastructure.tavily_mcp import TavilyMCPClient
 from requirement_agent.application.ingestion.tasks import run_worker_coroutine
 from requirement_agent.infrastructure.database.models import RequirementConversation
 from requirement_agent.infrastructure.database.session import get_session_factory
@@ -30,12 +34,12 @@ def register_conversation_tasks(celery_app: Celery) -> None:
         run_worker_coroutine(compact_conversation_memory(conversation_key))
     #把异步协程放进 Worker 的事件循环中执行。
     celery_app.task(name=COMPACT_CONVERSATION_TASK)(compact_conversation_task)
-    def process_chat_query_task(conversation_key: str, user_message_id: int, assistant_message_id: int, actor_id: str) -> None:
-        run_worker_coroutine(process_chat_query(conversation_key, user_message_id, assistant_message_id, actor_id))
+    def process_chat_query_task(conversation_key: str, user_message_id: int, assistant_message_id: int, actor_id: str, intent: str, requires_web_search: bool = False) -> None:
+        run_worker_coroutine(process_chat_query(conversation_key, user_message_id, assistant_message_id, actor_id, intent, requires_web_search))
     celery_app.task(name=CHAT_QUERY_TASK)(process_chat_query_task)
 
 
-async def process_chat_query(conversation_key: str, user_message_id: int, assistant_message_id: int, actor_id: str) -> bool:
+async def process_chat_query(conversation_key: str, user_message_id: int, assistant_message_id: int, actor_id: str, intent_value: str, requires_web_search: bool = False) -> bool:
     async with get_session_factory()() as session:
         claimed = await session.execute(update(ConversationMessage).where(
             ConversationMessage.id == assistant_message_id,
@@ -49,16 +53,27 @@ async def process_chat_query(conversation_key: str, user_message_id: int, assist
             user_message = await session.get(ConversationMessage, user_message_id)
             if user_message is None or user_message.conversation_id is None:
                 raise ValueError("query message was not found")
+            intent = ConversationIntent(intent_value)
+            history = await _history_before(session, user_message)
             settings = get_settings()
-            retriever = HybridRetriever(session, get_embedding_model(), RetrievalWeights(
-                keyword=settings.retrieval_keyword_weight, vector=settings.retrieval_vector_weight,
-                business=settings.retrieval_business_weight), candidate_limit=settings.retrieval_candidate_limit,
-                min_similarity_score=settings.retrieval_min_similarity_score)
-            intent = classify_conversation_message(user_message.content, has_attachment=False)
-            skill = get_skill("requirement_reporting") if intent == ConversationIntent.REPORTING_QUERY else get_skill()
-            answer, tool_calls, references = await ChatAgentService(
-                session, get_llm(), ChatToolService(session, retriever, actor_id), actor_id, conversation_key, skill
-            ).answer(user_message.content)
+            if intent == ConversationIntent.GENERAL_QUERY:
+                answer, tool_calls, references = await GeneralAssistantService(
+                    get_llm(), TavilyMCPClient(settings), conversation_key=conversation_key,
+                    tool_timeout_seconds=settings.tavily_mcp_timeout_seconds,
+                ).answer(
+                    user_message.content,
+                    history=history,
+                    requires_web_search=requires_web_search,
+                )
+            else:
+                retriever = HybridRetriever(session, get_embedding_model(), RetrievalWeights(
+                    keyword=settings.retrieval_keyword_weight, vector=settings.retrieval_vector_weight,
+                    business=settings.retrieval_business_weight), candidate_limit=settings.retrieval_candidate_limit,
+                    min_similarity_score=settings.retrieval_min_similarity_score)
+                skill = get_skill("requirement_reporting") if intent == ConversationIntent.REPORTING_QUERY else get_skill()
+                answer, tool_calls, references = await ChatAgentService(
+                    session, get_llm(), ChatToolService(session, retriever, actor_id), actor_id, conversation_key, skill
+                ).answer(user_message.content, history=history)
             await session.execute(update(ConversationMessage).where(ConversationMessage.id == assistant_message_id).values(
                 chat_status="completed", content=answer, tool_calls=tool_calls, references=references
             ))
@@ -71,6 +86,32 @@ async def process_chat_query(conversation_key: str, user_message_id: int, assist
             ))
             await session.commit()
             return False
+
+
+async def _history_before(
+    session: AsyncSession, current: ConversationMessage, limit: int = 6
+) -> list[dict[str, str]]:
+    """Bounded prompt context, deliberately independent from requirement RAG."""
+    rows = list((await session.execute(
+        select(ConversationMessage)
+        .options(selectinload(ConversationMessage.source_record))
+        .where(
+            ConversationMessage.conversation_id == current.conversation_id,
+            ConversationMessage.sequence_number < current.sequence_number,
+        )
+        .order_by(ConversationMessage.sequence_number.desc())
+        .limit(limit)
+    )).scalars())
+    return [
+        {
+            "role": item.role,
+            "content": (
+                item.source_record.raw_text if item.source_record is not None else item.content
+            )[:2_000],
+        }
+        for item in reversed(rows)
+        if item.role in {"user", "assistant"}
+    ]
 
 #Celery Worker 取到任务后，会把对应的 conversation_key 传进来，只压缩这一个会话，不会影响其他会话。
 async def compact_conversation_memory(conversation_key: str) -> bool:

@@ -2,6 +2,8 @@ import hashlib
 import json
 from collections import deque
 
+from pydantic import BaseModel
+
 
 class FakeLLM:
     def __init__(
@@ -33,6 +35,17 @@ class FakeLLM:
         if not self._responses:
             raise RuntimeError("FakeLLM has no response configured")
         return self._responses.popleft()
+
+    async def complete_structured(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        schema: type[BaseModel],
+        temperature: float = 0.1,
+    ) -> BaseModel:
+        return schema.model_validate_json(
+            await self.complete(messages, analysis_type="structured")
+        )
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         results: list[list[float]] = []

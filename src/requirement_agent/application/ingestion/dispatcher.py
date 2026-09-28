@@ -42,7 +42,7 @@ class TaskDispatcher(Protocol):#任务分发抽象接口
     def dispatch_conversation_compaction(self, conversation_key: str) -> None:#投递会话压缩任务。
         ...
 
-    def dispatch_chat_query(self, conversation_key: str, user_message_id: int, assistant_message_id: int, actor_id: str) -> None:
+    def dispatch_chat_query(self, conversation_key: str, user_message_id: int, assistant_message_id: int, actor_id: str, intent: str, requires_web_search: bool = False) -> None:
         ...
 
 
@@ -76,8 +76,8 @@ class CeleryTaskDispatcher:# Celery 任务分发器实现
     def dispatch_conversation_compaction(self, conversation_key: str) -> None:#投递会话压缩任务
         self._celery_app.send_task(COMPACT_CONVERSATION_TASK, args=[conversation_key])
 
-    def dispatch_chat_query(self, conversation_key: str, user_message_id: int, assistant_message_id: int, actor_id: str) -> None:
-        self._celery_app.send_task(CHAT_QUERY_TASK, args=[conversation_key, user_message_id, assistant_message_id, actor_id])
+    def dispatch_chat_query(self, conversation_key: str, user_message_id: int, assistant_message_id: int, actor_id: str, intent: str, requires_web_search: bool = False) -> None:
+        self._celery_app.send_task(CHAT_QUERY_TASK, args=[conversation_key, user_message_id, assistant_message_id, actor_id, intent, requires_web_search])
 
     #投递飞书事件
     #Celery 将任务消息写入 Redis，Worker 取到任务后执行对应的 feishu_event_task

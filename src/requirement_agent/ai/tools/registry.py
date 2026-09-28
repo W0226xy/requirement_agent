@@ -5,7 +5,8 @@ from pydantic import BaseModel
 
 from requirement_agent.ai.tools.schemas import (
     GetConversationSummaryInput, GetRequirementDetailInput, GetSourceDetailInput,
-    GetRequirementReportSnapshotInput, SearchRequirementsInput,
+    GetRequirementReportSnapshotInput, SearchRequirementsInput, TavilyExtractInput,
+    TavilySearchInput,
 )
 
 
@@ -22,6 +23,8 @@ class ToolDefinition:#每个工具的说明模板
                 "parameters": self.input_model.model_json_schema()}}
 
 
+
+
 TOOLS = (
     #按关键词、模块等查历史正式需求
     ToolDefinition("search_requirements", "查询已入库历史需求；涉及历史需求时优先调用。", SearchRequirementsInput),
@@ -33,6 +36,8 @@ TOOLS = (
     ToolDefinition("get_conversation_summary", "查询当前用户有权访问会话的摘要和最近消息概览。", GetConversationSummaryInput),
     #按当前用户权限计算需求报告所需的真实统计、审核、风险、变更和引用；不写入数据
     ToolDefinition("get_requirement_report_snapshot", "按当前用户权限计算需求报告所需的真实统计、审核、风险、变更和引用；不写入数据。", GetRequirementReportSnapshotInput),
+    ToolDefinition("tavily_search", "通过 Tavily MCP 搜索公开网页；新闻、最新、实时问题优先调用。", TavilySearchInput),
+    ToolDefinition("tavily_extract", "通过 Tavily MCP 提取已知网页 URL 的正文；先搜索再按需提取。", TavilyExtractInput),
 )
 TOOL_BY_NAME = {item.name: item for item in TOOLS}#是按工具名快速查找的字典
 

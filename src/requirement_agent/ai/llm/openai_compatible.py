@@ -3,7 +3,7 @@ from collections.abc import Mapping, Sequence
 
 import httpx
 
-from requirement_agent.ai.llm.base import ToolCall, ToolChatResponse
+from requirement_agent.ai.llm.base import SchemaT, ToolCall, ToolChatResponse
 from requirement_agent.shared.errors import (
     LLMEmptyContentError,
     LLMOutputBudgetExceededError,
@@ -219,6 +219,40 @@ class OpenAICompatibleChatModel(_OpenAICompatibleClient):
             raise LLMServiceError(
                 "tool chat response has an invalid OpenAI-compatible shape"
             ) from None
+
+    async def complete_structured(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        schema: type[SchemaT],
+        temperature: float = 0.1,
+    ) -> SchemaT:
+        """Request provider-enforced JSON schema output and validate it with Pydantic."""
+        payload: dict[str, object] = {
+            "model": self._model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": self._max_tokens,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema.__name__.lower(),
+                    "strict": True,
+                    "schema": schema.model_json_schema(),
+                },
+            },
+        }
+        response, _ = await self._post("/chat/completions", payload)
+        try:
+            choices = response["choices"]
+            if not isinstance(choices, Sequence) or isinstance(choices, str | bytes):
+                raise TypeError("choices must be an array")
+            message = choices[0]["message"]
+            if not isinstance(message, Mapping) or not isinstance(message.get("content"), str):
+                raise TypeError("structured response requires content")
+            return schema.model_validate_json(message["content"])
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise LLMServiceError("structured chat response is invalid") from exc
 
     def _log_chat_response(
         self,
