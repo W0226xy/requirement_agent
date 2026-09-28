@@ -48,6 +48,7 @@ import type {
   SourceRecord,
 } from "../types";
 import { applyReviewTaskUpdate } from "./conversationReviewUpdate";
+import { mergeServerMessages, upsertMessages } from "./conversationMessageState";
 
 type Draft = {
   task: ReviewTask;
@@ -83,6 +84,22 @@ function sortConversations(items: Conversation[]) {
     (left, right) =>
       new Date(right.updated_at).getTime() - new Date(left.updated_at).getTime(),
   );
+}
+
+function logChatMessageState(
+  source: string,
+  conversationKey: string,
+  messages: ConversationMessage[],
+  details: Record<string, unknown> = {},
+) {
+  if (!import.meta.env.DEV) return;
+  console.debug("chat_messages_state", {
+    source,
+    conversationId: conversationKey,
+    count: messages.length,
+    messageIds: messages.map((item) => item.message_key),
+    ...details,
+  });
 }
 
 export function ConversationPage() {
@@ -162,7 +179,12 @@ export function ConversationPage() {
   );
 
   const loadMessages = useCallback(
-    async (key: string, showLoading = false, reportError = true): Promise<boolean> => {
+    async (
+      key: string,
+      showLoading = false,
+      reportError = true,
+      source = showLoading ? "initial" : "refetch",
+    ): Promise<boolean> => {
       const generation = ++messageRequestGeneration.current;
       if (showLoading) setLoadingMessages(true);
       try {
@@ -177,7 +199,20 @@ export function ConversationPage() {
         ) {
           return false;
         }
-        setMessages(page.items);
+        logChatMessageState(source, key, page.items, {
+          phase: "response",
+          isLoading: showLoading,
+        });
+        setMessages((current) => {
+          const merged = mergeServerMessages(current, page.items);
+          logChatMessageState(source, key, merged, {
+            phase: "state-update",
+            previousCount: current.length,
+            serverCount: page.items.length,
+            isLoading: showLoading,
+          });
+          return merged;
+        });
         setError(null);
         return true;
       } catch (caught) {
@@ -301,7 +336,7 @@ export function ConversationPage() {
   useEffect(() => {
     if (!conversationKey || !hasActiveTurn) return;
     const timer = window.setInterval(() => {
-      void loadMessages(conversationKey);
+      void loadMessages(conversationKey, false, true, "polling");
       void loadConversationList();
     }, 3_000);
     return () => window.clearInterval(timer);
@@ -364,7 +399,15 @@ export function ConversationPage() {
     };
     // Render first. The server, not the browser, determines whether this is a query.
     scrollMode.current = "send";
-    setMessages((current) => [...current, temporaryUser, temporaryAssistant]);
+    logChatMessageState("send-before", conversationKey, messages, { isLoading: loadingMessages });
+    setMessages((current) => {
+      const next = [...current, temporaryUser, temporaryAssistant];
+      logChatMessageState("optimistic", conversationKey, next, {
+        previousCount: current.length,
+        isLoading: loadingMessages,
+      });
+      return next;
+    });
     setText("");
     setFile(null);
     if (fileInputRef.current) fileInputRef.current.value = "";
@@ -387,24 +430,33 @@ export function ConversationPage() {
         session,
       );
       if (activeKeyRef.current !== conversationKey) return;
-      setMessages((current) =>
-        [
-          ...current.filter((item) =>
-            item.message_key !== temporaryUserKey && item.message_key !== temporaryAssistantKey,
-          ),
-          result.message,
-          ...(result.assistant_message ? [result.assistant_message] : []),
-        ].sort(
-          (left, right) => left.sequence_number - right.sequence_number,
-        ),
+      logChatMessageState(
+        "post-response",
+        conversationKey,
+        [result.message, ...(result.assistant_message ? [result.assistant_message] : [])],
+        { intent: result.intent, replayed: result.replayed },
       );
+      setMessages((current) => {
+        const next = upsertMessages(
+          current.filter(
+            (item) =>
+              item.message_key !== temporaryUserKey &&
+              item.message_key !== temporaryAssistantKey,
+          ),
+          [result.message, ...(result.assistant_message ? [result.assistant_message] : [])],
+        );
+        logChatMessageState("post-replace-optimistic", conversationKey, next, {
+          previousCount: current.length,
+        });
+        return next;
+      });
       void message.success(
         ["traceability_query", "reporting_query", "general_query", "clarification"].includes(result.intent)
           ? (result.intent === "reporting_query" ? "需求报告正在生成" : "查询回答已加入会话")
           : result.replayed ? "该消息已提交，正在同步分析状态" : "需求已保存，AI 正在分析",
       );
       await Promise.all([
-        loadMessages(conversationKey),
+        loadMessages(conversationKey, false, true, "send-refetch"),
         loadConversationList(),
       ]);
     } catch (caught) {
@@ -733,7 +785,7 @@ export function ConversationPage() {
           </div>
         )}
         <div className="conversation-stream" ref={conversationStreamRef}>
-          {loadingMessages ? (
+          {loadingMessages && messages.length === 0 ? (
             <div className="state-block">
               <Spin size="large" />
             </div>
