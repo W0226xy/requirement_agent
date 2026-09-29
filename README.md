@@ -1,290 +1,648 @@
-# 多渠道输入需求管理 Agent
+# Requirement Agent
 
-这是一个采用 FastAPI、Celery、PostgreSQL/pgvector、Redis、MinIO 和 React
-构建的模块化单体应用。当前完成阶段 6 飞书集成。
+一个面向真实产品研发流程的**多渠道需求管理 Agent**。
 
-## 环境要求
+项目不是单纯的聊天机器人，而是一套以 **LLM + Agent + RAG + 人工审核 + 版本追溯** 为核心的需求管理系统。它可以接收网页文本、PDF、Word、截图和飞书消息等非结构化输入，自动完成文档解析、需求结构化提取、历史需求检索、重复/关联/冲突分析、风险识别、人工审核和正式版本沉淀。
 
-- Docker 24+ 与 Docker Compose v2
-- 可选：Python 3.12、Node.js 22
+同时，系统提供统一对话入口，通过 LLM 意图分类器区分“需求提交、需求追溯、需求报告、需求澄清和通用问答”。与需求管理无关的问题会进入 General Assistant，并可按需通过 **Tavily MCP** 获取实时网页信息，不会污染正式需求库和 RAG 数据。
 
-项目现有 `.venv` 是 Python 3.10，不能用于本项目。推荐直接使用 Docker，
-或重新创建 Python 3.12 虚拟环境。
+---
 
-## 首次启动
+## 1. 核心能力
+
+### 多渠道需求接入
+
+支持多种需求来源：
+
+- Web 对话文本
+- PDF
+- DOCX
+- PNG / JPEG 截图
+- 飞书消息、图片和文件
+
+附件统一保存到 MinIO，来源、解析状态和处理记录保存到 PostgreSQL。
+
+### 文档解析与 OCR
+
+系统根据附件类型执行不同解析流程：
+
+- PDF：PyMuPDF
+- Word：python-docx
+- 图片：PaddleOCR
+- 文本：直接进入需求分析链路
+
+解析完成后将正文写入来源记录，并异步进入后续 AI 分析。
+
+### LLM 结构化需求提取
+
+需求文本经过 OpenAI-compatible LLM 处理后，提取为结构化字段，包括：
+
+- 需求摘要
+- 需求描述
+- 功能模块
+- 验收标准
+- 待确认问题
+- 关键实体
+
+模型输出使用 Pydantic Structured Output 校验，避免自由文本直接进入业务数据。
+
+### 混合 RAG 检索
+
+系统使用三路检索召回历史正式需求：
+
+```text
+Keyword Retrieval
+        +
+Vector Retrieval
+        +
+Business Field Retrieval
+        ↓
+Hybrid Retriever
+```
+
+默认权重：
+
+```text
+0.4 × keyword_score
++ 0.4 × vector_score
++ 0.2 × business_field_score
+```
+
+其中：
+
+- PostgreSQL GIN：全文关键词检索
+- pgvector HNSW：向量相似度检索
+- 业务字段：模块和结构化字段匹配
+
+只检索已经审核并进入正式版本的需求投影。
+
+### 需求关系与冲突分析
+
+在检索候选需求后，Agent 会结合当前输入分析：
+
+- duplicate：重复需求
+- related：相关需求
+- conflict：冲突需求
+- modify / replace：修改或替代关系
+- dependency：依赖关系
+
+分析结果不会直接修改正式需求，而是生成审核材料。
+
+### 人工审核与版本管理
+
+AI 负责分析，**人负责最终决策**。
+
+审核人员可以：
+
+- 创建新需求
+- 合并到已有需求
+- 修改标准化结果
+- 新增功能
+- 修改功能
+- 删除功能
+- 恢复功能
+- 退回
+- 驳回
+- 重新分析
+
+正式需求采用版本快照管理：
+
+```text
+Requirement
+    ↓
+RequirementVersion
+    ↓
+RequirementFeature
+    ↓
+FeatureLineage
+```
+
+每次变更都保留来源和版本信息，实现完整需求追溯。
+
+---
+
+## 2. 对话 Agent
+
+系统使用统一聊天入口，不同问题由 IntentClassifier 自动路由。
+
+### 意图分类
+
+当前支持五类意图：
+
+```text
+REQUIREMENT_SUBMISSION
+TRACEABILITY_QUERY
+REPORTING_QUERY
+CLARIFICATION
+GENERAL_QUERY
+```
+
+示例：
+
+```text
+“新增停车位置管理功能”
+→ REQUIREMENT_SUBMISSION
+
+“之前有没有停车位置相关需求？”
+→ TRACEABILITY_QUERY
+
+“总结一下当前车辆相关需求”
+→ REPORTING_QUERY
+
+“需要支持单独关闭提醒”
+→ CLARIFICATION
+
+“PostgreSQL GIN 是什么？”
+→ GENERAL_QUERY
+```
+
+IntentClassifier 使用：
+
+```text
+LLM
++
+Pydantic Structured Output
++
+最近少量会话上下文
+```
+
+分类结果结构：
+
+```python
+class IntentClassification(BaseModel):
+    intent: ConversationIntent
+    confidence: float
+    requires_web_search: bool
+```
+
+LLM 分类失败时会自动降级到关键词规则，避免聊天链路不可用。
+
+### 路由流程
+
+```mermaid
+flowchart TD
+    U[User] --> API[Chat API]
+    API --> IC[IntentClassifier]
+
+    IC -->|Requirement Submission| ING[需求提交链路]
+    IC -->|Traceability Query| TRACE[Requirement Traceability Skill]
+    IC -->|Reporting Query| REPORT[Requirement Reporting Skill]
+    IC -->|Clarification| CLR[会话澄清处理]
+    IC -->|General Query| GA[General Assistant]
+
+    ING --> SR[SourceRecord]
+    SR --> CELERY[Celery]
+    CELERY --> PARSE[解析 / OCR]
+    PARSE --> EXTRACT[结构化提取]
+    EXTRACT --> RAG[Hybrid Retriever]
+    RAG --> ANALYSIS[关系 / 冲突 / 风险分析]
+    ANALYSIS --> REVIEW[人工审核]
+
+    TRACE --> TOOLS[Requirement Tools]
+    REPORT --> TOOLS
+
+    GA --> TC{是否需要实时信息}
+    TC -->|No| LLM[LLM Answer]
+    TC -->|Yes| MCP[Tavily MCP]
+    MCP --> LLM
+```
+
+---
+
+## 3. Skill 与 Function Calling
+
+Agent 不直接拥有全部工具，而是由 Skill 控制工具白名单。
+
+### Requirement Traceability
+
+用于查询：
+
+- 历史需求
+- 需求详情
+- 来源记录
+- 会话摘要
+
+工具包括：
+
+```text
+search_requirements
+get_requirement_detail
+get_source_detail
+get_conversation_summary
+```
+
+### Requirement Reporting
+
+用于生成需求报告和统计。
+
+主要工具：
+
+```text
+get_requirement_report_snapshot
+get_conversation_summary
+get_requirement_detail
+```
+
+### General Assistant
+
+处理与需求管理无关的普通问题。
+
+允许工具：
+
+```text
+tavily_search
+tavily_extract
+```
+
+Agent Tool Calling 最多执行 3 轮，并对工具参数进行 Pydantic 校验、超时控制和异常降级。
+
+---
+
+## 4. Tavily MCP 通用联网能力
+
+General Assistant 在问题涉及以下内容时可自动使用 Tavily：
+
+- 最新信息
+- 新闻
+- 实时数据
+- 当前版本
+- 指定网页内容
+
+稳定知识默认由 LLM 直接回答，不强制联网。
+
+调用链：
+
+```text
+GENERAL_QUERY
+    ↓
+General Assistant
+    ↓
+LLM Tool Calling
+    ↓
+Tavily MCP
+    ↓
+tavily_search / tavily_extract
+    ↓
+Tool Result
+    ↓
+LLM Final Answer
+```
+
+Tavily 使用 Hosted MCP Server，而不是直接调用 Tavily HTTP API。
+
+配置：
+
+```env
+TAVILY_MCP_ENABLED=true
+TAVILY_MCP_URL=https://mcp.tavily.com/mcp/
+TAVILY_API_KEY=your-tavily-api-key
+TAVILY_MCP_TIMEOUT_SECONDS=60
+```
+
+联网返回的 URL 会保存为消息引用，前端可直接查看来源。
+
+通用问答只保存为 `ConversationMessage`，不会创建：
+
+```text
+SourceRecord
+Requirement
+RequirementEmbedding
+ReviewTask
+```
+
+因此不会污染正式需求库。
+
+---
+
+## 5. 会话记忆
+
+系统通过：
+
+```text
+RequirementConversation
+ConversationMessage
+```
+
+保存多轮会话。
+
+上下文由两部分组成：
+
+```text
+长期摘要
++
+最近消息
+```
+
+历史消息超过上下文窗口后，会压缩进入 Conversation Summary；近期消息继续作为短期上下文提供给 Agent。
+
+这样既能保持多轮理解能力，又能限制 Prompt 长度。
+
+例如：
+
+```text
+User:
+LangGraph 是什么？
+
+Assistant:
+...
+
+User:
+那它和 LangChain 有什么区别？
+```
+
+第二轮仍能理解“它”指 LangGraph。
+
+需求会话中的历史上下文同样可以帮助模型理解后续补充、修改和澄清。
+
+---
+
+## 6. 异步任务
+
+耗时任务通过 Celery + Redis 异步执行。
+
+主要流程包括：
+
+```text
+parse_source_attachments
+        ↓
+analyze_source
+        ↓
+index_requirement_version
+        ↓
+compact_conversation
+```
+
+典型需求处理：
+
+```text
+received
+   ↓
+parsing
+   ↓
+parsed
+   ↓
+extracting
+   ↓
+retrieving
+   ↓
+analyzing
+   ↓
+pending_review
+```
+
+附件解析失败时进入失败状态，并支持任务重试。
+
+---
+
+## 7. 技术栈
+
+### Backend
+
+- Python 3.12
+- FastAPI
+- SQLAlchemy Async
+- Pydantic
+- LangGraph
+- Celery
+- Redis
+- Alembic
+
+### AI / Agent
+
+- OpenAI-compatible Chat Model
+- OpenAI-compatible Embedding
+- Structured Output
+- Function Calling
+- Skill-based Tool Registry
+- Tavily MCP
+- Hybrid RAG
+
+### Storage
+
+- PostgreSQL 16
+- pgvector
+- PostgreSQL GIN
+- MinIO
+
+### Parser
+
+- PyMuPDF
+- python-docx
+- PaddleOCR
+- PaddlePaddle
+
+### Frontend
+
+- React
+- TypeScript
+- Vite
+- Ant Design
+
+### Infrastructure
+
+- Docker
+- Docker Compose
+
+---
+
+## 8. 项目结构
+
+```text
+requirement_agent/
+├── apps/
+│   ├── api/                    # FastAPI 服务
+│   ├── web/                    # React 前端
+│   └── worker/                 # Celery Worker
+│
+├── src/requirement_agent/
+│   ├── ai/
+│   │   ├── llm/                # LLM Adapter
+│   │   ├── retrieval/          # Hybrid Retriever
+│   │   ├── tools/              # Function Calling Tools
+│   │   └── skills.py           # Agent Skill Registry
+│   │
+│   ├── application/
+│   │   ├── conversations/      # 会话、意图分类与上下文
+│   │   ├── chat_agent.py       # Agent Tool Loop
+│   │   └── general_assistant.py
+│   │
+│   ├── infrastructure/
+│   │   ├── database/
+│   │   └── tavily_mcp.py       # Tavily MCP Client
+│   │
+│   └── shared/
+│       └── config.py
+│
+├── migrations/                 # Alembic 数据库迁移
+├── tests/                      # 单元测试 / 集成测试 / RAG 评测
+├── docker/
+├── docker-compose.yml
+├── pyproject.toml
+├── .env.example
+└── README.md
+```
+
+---
+
+## 9. 快速启动
+
+### 环境要求
+
+推荐：
+
+```text
+Docker 24+
+Docker Compose v2
+```
+
+本地开发：
+
+```text
+Python 3.12
+Node.js 22
+```
+
+### 1. 克隆项目
+
+```bash
+git clone https://github.com/W0226xy/requirement_agent.git
+cd requirement_agent
+```
+
+### 2. 创建配置
 
 ```bash
 cp .env.example .env
-# 修改 .env 中的密码和模型配置，不要提交 .env
+```
+
+至少配置：
+
+```env
+LLM_BASE_URL=
+LLM_API_KEY=
+LLM_MODEL=
+
+EMBEDDING_BASE_URL=
+EMBEDDING_API_KEY=
+EMBEDDING_MODEL=
+EMBEDDING_DIMENSION=1024
+```
+
+如需联网问答：
+
+```env
+TAVILY_MCP_ENABLED=true
+TAVILY_MCP_URL=https://mcp.tavily.com/mcp/
+TAVILY_API_KEY=
+TAVILY_MCP_TIMEOUT_SECONDS=60
+```
+
+### 3. 构建并启动
+
+```bash
 docker compose build
 docker compose up -d
+```
+
+### 4. 数据库迁移
+
+```bash
 docker compose exec api alembic upgrade head
 ```
 
-访问地址：
-
-- 管理后台：<http://localhost:5173>
-- OpenAPI：<http://localhost:8000/docs>
-- 存活检查：<http://localhost:8000/health/live>
-- 就绪检查：<http://localhost:8000/health/ready>
-- MinIO 控制台：<http://localhost:9001>
-
-查看服务状态和日志：
+### 5. 查看运行状态
 
 ```bash
 docker compose ps
-docker compose logs --tail=100 api worker
 ```
 
-停止服务：
+日志：
 
 ```bash
-docker compose down
-```
-
-`docker compose down` 不会删除数据卷。除非明确需要清空本地开发数据，否则不要添加
-`--volumes`。
-
-## 数据库迁移
-
-```bash
-docker compose exec api alembic upgrade head
-docker compose exec api alembic current
-```
-
-PostgreSQL 初始化脚本和首个 Alembic 迁移都会幂等地启用 `vector` 扩展。
-
-迁移创建：
-
-- `source_record`：不可覆盖的原始输入。
-- `source_attachment`：附件身份、MinIO 路径和解析结果。
-- `audit_log`：不可修改的关键操作记录。
-- `analysis_result`、`requirement_embedding`：AI 调用记录和检索投影。
-- `review_task`：持久化审核材料、决策及提交结果。
-- `requirement`、`requirement_version`、`requirement_feature`：需求主表和完整版本快照。
-- `feature_lineage`：功能新增、修改、删除和恢复的原始输入来源。
-
-PostgreSQL 触发器禁止修改原始内容、附件身份和审计日志，也禁止删除这些记录。
-
-## 提交原始需求
-
-### Web 表单输入
-
-`Idempotency-Key` 表示渠道事件 ID。同一个 Key 和相同内容重复提交时返回原记录；
-同一个 Key 携带不同内容时返回 `409 IDEMPOTENCY_CONFLICT`。
-
-```bash
-curl -X POST http://localhost:8000/api/v1/ingestions \
-  -H 'Content-Type: application/json' \
-  -H 'Idempotency-Key: web-form-example-0001' \
-  -d '{
-    "submitter_id": "user-001",
-    "submitter_name": "测试用户",
-    "raw_text": "报表页面需要支持导出 PDF",
-    "raw_metadata": {"module": "reporting"}
-  }'
-```
-
-首次接收返回 HTTP `202`，重复提交返回 HTTP `200`，并将 `replayed` 设为 `true`。
-
-### 上传 PDF、DOCX 或截图
-
-```bash
-curl -X POST http://localhost:8000/api/v1/files \
-  -H 'Idempotency-Key: file-example-0001' \
-  -F 'submitter_id=user-001' \
-  -F 'submitter_name=测试用户' \
-  -F 'raw_text=附件中的产品需求' \
-  -F 'file=@./requirement.pdf;type=application/pdf'
-```
-
-允许的格式：
-
-- PDF：`application/pdf`
-- Word：`application/vnd.openxmlformats-officedocument.wordprocessingml.document`
-- 截图：`image/png`、`image/jpeg`
-
-默认单文件上限为 50 MiB，由 `MAX_UPLOAD_SIZE_BYTES` 配置。后端同时检查扩展名、
-MIME 和文件签名，客户端声明的类型不能绕过校验。
-
-### 查询原始记录
-
-```bash
-curl 'http://localhost:8000/api/v1/source-records?page=1&page_size=20'
-curl 'http://localhost:8000/api/v1/source-records/1'
-curl 'http://localhost:8000/api/v1/source-records?channel_type=document'
-```
-
-### 飞书事件订阅
-
-在 `.env` 配置 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`、
-`FEISHU_VERIFICATION_TOKEN` 和 `FEISHU_ENCRYPT_KEY`，并将飞书事件订阅地址设置为：
-
-```text
-POST https://<公开域名>/api/v1/connectors/feishu/events
-```
-
-接口同步完成 URL verification、verification token 和 v2 callback signature 校验，然后立即
-返回并把 `im.message.receive_v1` 事件交给 Celery。文本消息的 JSON `content` 会转换为原始
-需求；图片和文件使用租户访问令牌从飞书开放平台下载，经统一附件大小、扩展名、MIME 和
-文件签名校验后写入 MinIO。`event_id` 是渠道幂等键。
-
-租户令牌会在内存中缓存并在过期前刷新。开放平台请求默认超时 10 秒，可通过
-`FEISHU_TIMEOUT_SECONDS` 调整；私有化部署可通过 `FEISHU_BASE_URL` 更改开放平台地址。
-凭据、verification token、encrypt key 和租户访问令牌不会写入来源元数据或错误消息。
-当前版本会安全拒绝 `encrypt` 加密回调；请在飞书后台启用 v2 签名，但不要启用消息体加密。
-
-### 异步解析状态
-
-输入持久化后才会投递 Celery 任务：
-
-```text
-received → parsing
-                 ├─ 附件成功：parsed
-                 └─ 附件失败：failed，原始记录进入 parse_failed
-```
-
-解析完成后会继续执行阶段 3 分析，并创建待处理审核任务。
-
-查看 Worker：
-
-```bash
+docker compose logs -f api
 docker compose logs -f worker
 ```
 
-Worker 使用 `source_processing` 队列；解析失败最多自动重试三次。任务和解析操作均为
-幂等设计，已解析附件不会再次写入。
+---
 
-## AI 分析工作流
+## 10. 服务地址
 
-阶段 3 使用 LangGraph 编排：
+启动成功后：
 
-```text
-结构化提取
-→ 字段/全文/向量混合检索
-→ 重复、关联、冲突、替代和依赖分析
-→ 风险分析与标准变更建议
-→ pending_review
-```
+| 服务 | 地址 |
+|---|---|
+| Web 管理后台 | http://localhost:5173 |
+| FastAPI OpenAPI | http://localhost:8000/docs |
+| API Live Check | http://localhost:8000/health/live |
+| API Ready Check | http://localhost:8000/health/ready |
+| MinIO Console | http://localhost:9001 |
 
-LangGraph 只编排分析步骤。业务状态、输入、输出、错误和耗时都保存在 PostgreSQL。
-AI 不会创建或修改正式需求版本。
+---
 
-### 模型配置
+## 11. Web 管理后台
 
-聊天和 Embedding 可以来自两个不同的 OpenAI 兼容服务，在 `.env` 中分别配置：
+主要页面：
 
 ```text
-LLM_BASE_URL=https://api.openai.com/v1
-LLM_API_KEY=replace-with-your-chat-api-key
-LLM_MODEL=replace-with-your-chat-model
-EMBEDDING_BASE_URL=https://embedding-provider.example/v1
-EMBEDDING_API_KEY=replace-with-your-embedding-api-key
-EMBEDDING_MODEL=replace-with-your-embedding-model
-EMBEDDING_DIMENSION=1024
-LLM_TIMEOUT_SECONDS=60
-LLM_MAX_RETRIES=2
+/chat
+/requirements
+/requirements/{id}
+/reviews
+/reviews/{id}
+/sources
+/sources/{id}
+/search
+/analysis
+/connectors
 ```
 
-`EMBEDDING_DIMENSION` 在首次执行阶段 3 迁移时决定 PostgreSQL `vector(n)` 的维度，
-之后不能只修改环境变量；更换维度需要新增迁移并重建向量数据和 HNSW 索引。
-当前项目的实际 Embedding 服务返回 1024 维，迁移 `20260904_0005` 将已有开发数据库从
-1536 维调整为 1024 维。部署时该值必须与模型服务的真实输出维度严格一致。
+其中 `/chat` 是统一对话入口，可以同时处理：
 
-聊天客户端只访问 `{LLM_BASE_URL}/chat/completions`，使用 `LLM_API_KEY` 和
-`LLM_MODEL`。Embedding 客户端只访问 `{EMBEDDING_BASE_URL}/embeddings`，使用
-`EMBEDDING_API_KEY` 和 `EMBEDDING_MODEL`。两个客户端、协议和缓存工厂彼此独立。
+- 正式需求提交
+- 需求追溯
+- 需求报告
+- 需求澄清
+- 普通知识问答
+- 实时联网搜索
 
-API 和 Worker 通过 Docker Compose 的同一个 `.env` 配置运行。修改任一模型配置后需
-重建或重启两个服务：
+---
 
-```bash
-docker compose up -d --force-recreate api worker
+## 12. 飞书接入
+
+配置：
+
+```env
+FEISHU_APP_ID=
+FEISHU_APP_SECRET=
+FEISHU_VERIFICATION_TOKEN=
+FEISHU_ENCRYPT_KEY=
 ```
 
-API Key 不得写入源码或提交到 Git，也不会写入异常信息、运行日志或
-`analysis_result` 审计记录。
-
-### 结构化输出保障
-
-- 模型仅返回 JSON。
-- Pydantic 拒绝未知字段、错误枚举和 `null` 数组。
-- 第一次失败后将具体校验错误反馈给模型。
-- 最多自动纠错两次，即总计最多三次调用。
-- 每次尝试都写入 `analysis_result`，包括输入、原始输出、结果、模型、提示词版本、
-  耗时和错误。
-- 连续失败后来源状态进入 `extraction_failed` 或 `analysis_failed`。
-
-测试使用 `FakeLLM`，不会访问真实模型服务。
-
-固定评测集位于 `tests/ai_evaluation/cases.json`，覆盖完全重复、语义重复、可共存关联、
-明确矛盾、替代、依赖、信息不足和无关需求。
-
-### 查询 AI 调用
-
-```bash
-curl 'http://localhost:8000/api/v1/analysis-results?page=1&page_size=20'
-curl 'http://localhost:8000/api/v1/analysis-results?source_record_id=1'
-curl 'http://localhost:8000/api/v1/analysis-results?failed_only=true'
-```
-
-重新分析：
-
-```bash
-curl -X POST http://localhost:8000/api/v1/source-records/1/reanalyze
-```
-
-### 混合检索
-
-默认排序权重来自环境变量：
+事件回调：
 
 ```text
-0.4 × keyword_score + 0.4 × vector_score + 0.2 × business_field_score
+POST /api/v1/connectors/feishu/events
 ```
 
-三个权重必须合计为 `1.0`，候选数量限制为 10–20。全文检索使用 PostgreSQL GIN，
-向量检索使用 pgvector HNSW。模型只能引用后端返回的候选 `requirement_key`。
+飞书消息会转换为统一 SourceRecord，再进入 Celery 需求处理链路。
 
-```bash
-curl -X POST http://localhost:8000/api/v1/search \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "query": "报表导出 PDF",
-    "query_modules": ["reporting"],
-    "filter_modules": [],
-    "statuses": ["active"]
-  }'
+支持：
+
+- 文本
+- 图片
+- 文件
+
+---
+
+## 13. RAG 离线评测
+
+项目提供固定人工标注数据集：
+
+```text
+tests/fixtures/rag_eval_cases.jsonl
 ```
 
-`requirement_embedding` 是不可变检索投影，只索引正式版本；混合检索会过滤掉历史投影，
-仅返回需求主表指向的当前版本。
-
-### 离线 RAG Recall@K 评测
-
-`tests/fixtures/rag_eval_cases.jsonl` 是人工标注的固定评测集，用于衡量
-`HybridRetriever` 是否能召回正确的、已审核的当前正式需求。每行是一个 JSON 对象：
-
-```json
-{
-  "case_id": "rag-001",
-  "query": {
-    "requirement_summary": "车辆中心保养提醒入口调整",
-    "requirement_description": "仅在车辆中心展示下次保养日期和剩余里程。",
-    "functional_modules": ["车辆保养提醒", "车辆中心"]
-  },
-  "relevant_requirement_keys": ["REQ-EVAL-001"],
-  "relation_type": "modify",
-  "note": "人工标注依据"
-}
-```
-
-`relevant_requirement_keys` 是人工确认的答案；它为空时必须填写
-`skip_reason`，该样本会保留在报告中但不参与 Macro Recall。指标以去重后的
-`requirement_key` 计算：`Recall@K = |Top-K ∩ relevant| / |relevant|`，因此一个
-需求的多个投影不会占用多个名额。新增样本时请只使用固定种子中存在的需求 key，人工
-填写答案、关系类型和标注说明，并运行测试确认 JSONL 合法。
-
-运行完全隔离的评测（不会使用或写入开发数据库，也不会调用聊天模型或外部 Embedding）：
+可执行：
 
 ```bash
 python -m requirement_agent.evaluation.rag \
@@ -293,150 +651,39 @@ python -m requirement_agent.evaluation.rag \
   --output reports/rag_evaluation.json
 ```
 
-命令同时输出 JSON 报告和简表，比较 Keyword only（仅全文关键词）、Vector only（仅向量）
-与 Hybrid（0.4/0.4/0.2）。离线种子使用确定性本地 Embedding，便于回归测试；生产环境
-仍使用 PostgreSQL 全文检索、pgvector 和既有默认权重。结果适合比较同一固定数据集上的
-回归趋势，不应直接外推为生产流量指标。
+用于比较：
 
-## 人工审核和版本提交
+```text
+Keyword Only
+Vector Only
+Hybrid Retrieval
+```
 
-AI 分析完成后会幂等创建一条 `review_task`。审核数据与正式版本严格分离，只有拥有
-`reviewer` 或 `admin` 角色的请求才能批准、退回、驳回或要求重新分析：
+指标采用 Recall@K。
+
+---
+
+## 14. 测试与代码质量
+
+运行测试：
 
 ```bash
-curl 'http://localhost:8000/api/v1/review-tasks?review_status=pending'
-curl 'http://localhost:8000/api/v1/review-tasks/1'
+docker compose run --rm api pytest -p no:cacheprovider
 ```
 
-批准并创建新需求：
+Ruff：
 
 ```bash
-curl -X POST 'http://localhost:8000/api/v1/review-tasks/1/approve' \
-  -H 'Content-Type: application/json' \
-  -H 'X-Actor-ID: reviewer-001' \
-  -H 'X-Actor-Role: reviewer' \
-  -d '{
-    "decision": "create",
-    "title": "报表导出",
-    "operations": [{
-      "operation": "add",
-      "feature_key": null,
-      "content": {
-        "module": "报表",
-        "feature_title": "导出 PDF",
-        "feature_description": "用户可以将报表导出为 PDF",
-        "acceptance_criteria": ["点击导出后下载 PDF 文件"]
-      },
-      "source_record_id": 1,
-      "reason": "新增导出能力"
-    }],
-    "comment": "审核通过"
-  }'
+docker compose run --rm api ruff check .
 ```
 
-合并到已有需求时使用 `"decision": "merge"`，并传入下拉框所选需求的
-`target_requirement_key`、`expected_requirement_id` 和 `expected_current_version`。后端按
-key 锁定目标需求，再校验 ID 与当前版本，避免陈旧页面或字段错配误写到新需求。审核人可在
-提交前编辑 `operations`，但只能使用 `add`、`modify`、`delete`、`restore`。后端会锁定
-审核任务和需求、验证功能状态、生成完整快照及差异、记录来源和审计，并在同一事务中更新
-当前版本指针。重复提交同一审核任务会返回首次生成的版本，不会创建重复版本。
-
-例如将审核任务合并到列表中选定的 `REQ-8F2A19CD`（ID `42`、当前 v3）：
-
-```json
-{
-  "decision": "merge",
-  "title": null,
-  "target_requirement_key": "REQ-8F2A19CD",
-  "expected_requirement_id": 42,
-  "expected_current_version": 3,
-  "operations": [{ "operation": "add", "feature_key": null, "content": { "module": "报表", "feature_title": "导出 CSV", "feature_description": "支持 CSV 导出", "acceptance_criteria": ["可下载 CSV"] }, "source_record_id": 1, "reason": "新增格式" }],
-  "comment": "合并到现有需求"
-}
-```
-
-退回、驳回和重新分析：
+Mypy：
 
 ```bash
-curl -X POST 'http://localhost:8000/api/v1/review-tasks/1/return' \
-  -H 'Content-Type: application/json' \
-  -H 'X-Actor-ID: reviewer-001' \
-  -H 'X-Actor-Role: reviewer' \
-  -d '{"comment":"请补充验收条件"}'
-
-curl -X POST 'http://localhost:8000/api/v1/review-tasks/1/reject' \
-  -H 'Content-Type: application/json' \
-  -H 'X-Actor-ID: reviewer-001' \
-  -H 'X-Actor-Role: reviewer' \
-  -d '{"comment":"不符合产品方向"}'
+docker compose run --rm api mypy
 ```
 
-版本提交成功后，Worker 异步生成需求级和功能级 Embedding 投影。任务重复执行不会产生
-重复投影。
-
-### 查询正式需求与版本
-
-```bash
-curl 'http://localhost:8000/api/v1/requirements?page=1&page_size=20'
-curl 'http://localhost:8000/api/v1/requirements/1'
-curl 'http://localhost:8000/api/v1/requirements/1/versions'
-curl 'http://localhost:8000/api/v1/requirements/1/versions/1'
-curl 'http://localhost:8000/api/v1/requirements/1/diff'
-curl 'http://localhost:8000/api/v1/requirements/1/diff?to_version=2'
-```
-
-需求详情按功能返回全部来源事件，包括来源记录、引入或变更版本、操作类型和证据。
-`requirement_version`、`requirement_feature`、`feature_lineage` 由 PostgreSQL 触发器
-禁止更新或删除；删除功能只会创建 `feature_status=deleted` 的新版本快照。
-
-## 管理后台
-
-浏览器打开 <http://localhost:5173>。当前使用开发身份登录：填写审核人 ID、显示名称并
-选择 `reviewer` 或 `admin` 角色。浏览器只保存身份标识，后端仍会在所有审核操作上检查
-角色请求头；生产环境需要在后续部署集成中替换为企业 SSO 或网关认证。
-
-后台页面包括：
-
-- `/chat`：默认需求对话页。支持输入文本或上传 PDF、Word、截图；实时显示处理进度，
-  并在同一条对话中返回结构化需求、重复/冲突判断、风险和待确认问题。用户可修改标题、
-  模块、描述及验收标准后保留需求，也可选择不保留，或进入高级审核合并已有需求。
-- `/requirements`：正式需求列表、状态和模块筛选。
-- `/requirements/{id}`：当前功能、完整来源链路、版本历史、差异和快照。
-- `/reviews`：按状态查看人工审核任务。
-- `/reviews/{id}`：并排查看原始资料、附件解析、AI 提取、候选需求、冲突、风险和问题；
-  可编辑标准变更 JSON，然后创建需求、合并已有需求、批准、退回、驳回或重新分析。
-- `/sources`、`/sources/{id}`：原始输入、附件解析结果和 AI 调用链。
-- `/search`：普通字段、全文与向量混合检索。
-- `/analysis`：AI 调用记录、失败任务和重试入口。
-- `/connectors`：内置渠道状态和已启用的飞书接入说明。
-
-Vite 将 `/api` 和 `/health` 代理到 `VITE_API_PROXY_TARGET`。Docker Compose 默认指向
-`http://api:8000`，因此浏览器不需要单独配置 CORS。
-
-### 对话式需求流程
-
-1. 登录后默认进入“提出需求”。
-2. 输入需求描述；也可以附加一个 PDF、DOCX、PNG 或 JPEG 文件。
-3. 页面每三秒刷新一次处理状态，显示解析、提取、检索和分析进度。
-4. AI 分析完成后，同一对话中展示需求摘要、历史候选、冲突证据、风险和待确认问题。
-5. 选择“修改后保留”，确认正式标题、模块、描述及验收标准。后端使用标准 `add`
-   操作创建版本，模型不能直接写正式需求。
-6. 选择“不保留”时只更新审核状态，原始输入和分析记录仍会保存。
-7. 需要合并已有需求或编辑复杂操作时，点击“合并已有需求 / 高级审核”。
-
-页面刷新后会按当前登录用户的 `actorId` 重新加载历史对话，处理中的需求会继续自动刷新，
-因此关闭浏览器不会中断后台 Celery 分析任务。
-
-失败任务接口：
-
-```bash
-curl 'http://localhost:8000/api/v1/failed-jobs?page=1&page_size=20'
-curl -X POST 'http://localhost:8000/api/v1/failed-jobs/12/retry' \
-  -H 'X-Actor-ID: reviewer-001' \
-  -H 'X-Actor-Role: reviewer'
-```
-
-前端质量检查：
+前端：
 
 ```bash
 npm --prefix apps/web install
@@ -444,85 +691,104 @@ npm --prefix apps/web run lint
 npm --prefix apps/web run build
 ```
 
-## 后端本地开发
+---
+
+## 15. Tavily MCP 排查
+
+确认 Worker 已安装 MCP SDK：
 
 ```bash
-python3.12 -m venv .venv312
-source .venv312/bin/activate
-pip install -e ".[dev]"
-cp .env.example .env
-uvicorn apps.api.main:app --reload
+docker compose exec -T worker python -c "import mcp; print('mcp installed')"
 ```
 
-Worker：
+确认配置：
 
 ```bash
-celery -A apps.worker.celery_app:celery_app worker --loglevel=INFO
+docker compose exec -T worker python - <<'PY'
+from requirement_agent.shared.config import get_settings
+
+s = get_settings()
+
+print("enabled =", s.tavily_mcp_enabled)
+print("url =", s.tavily_mcp_url)
+print("key_configured =", bool(s.tavily_api_key.get_secret_value()))
+print("timeout =", s.tavily_mcp_timeout_seconds)
+PY
 ```
 
-## 前端本地开发
+当前 Tavily MCP Client 会在真正调用前执行：
 
-```bash
-cd apps/web
-npm install
-npm run dev
+```text
+connect
+→ initialize
+→ list_tools
+→ call_tool
 ```
 
-## 质量检查和测试
+并记录阶段化错误日志，便于定位 MCP 连接、鉴权、工具发现、参数或超时问题。
 
-使用 Python 3.12 容器：
+---
 
-```bash
-docker compose run --rm api ruff check .
-docker compose run --rm api mypy
-docker compose run --rm api pytest -p no:cacheprovider
-docker compose run --rm web npm run build
+## 16. 数据安全与约束
+
+项目对关键业务数据采用“AI 建议 + 人工审核”的方式：
+
+- AI 不直接创建正式需求版本
+- Tool 使用 Skill 白名单限制
+- Function Calling 参数通过 Pydantic 校验
+- API Key 不进入源码
+- Tavily Key 使用 Bearer Header
+- 原始输入、版本和来源链路持久化
+- 正式需求修改通过版本快照完成
+- Agent Tool Call 可记录审计日志
+- 通用联网问答与正式需求数据隔离
+
+---
+
+## 17. 项目特点
+
+与普通 RAG Demo 不同，本项目重点解决的是一个完整的需求生命周期：
+
+```text
+多渠道输入
+   ↓
+解析 / OCR
+   ↓
+结构化需求提取
+   ↓
+RAG 历史需求召回
+   ↓
+重复 / 关联 / 冲突分析
+   ↓
+风险与变更建议
+   ↓
+人工审核
+   ↓
+正式需求版本
+   ↓
+Feature Lineage
+   ↓
+后续追溯 / 报告 / 对话查询
 ```
 
-阶段 2 也可以在 Python 3.12 环境直接验证：
+同时通过：
 
-```bash
-ruff check .
-mypy
-pytest
+```text
+IntentClassifier
++
+Skill
++
+Function Calling
++
+MCP
++
+Conversation Memory
 ```
 
-## 配置安全
+将系统从单一需求分析流程扩展为具备路由、工具调用、记忆和联网能力的 Agent。
 
-- API Key、数据库密码和渠道密钥只通过环境变量或 Secret Manager 提供。
-- `.env` 已加入 `.gitignore`。
-- `.env.example` 中只有本地开发占位值，生产环境必须替换。
-- `channel_connector.config_json` 后续只保存密钥引用，不保存明文 Token。
+---
 
-## 常见问题
+## License
 
-### API 显示数据库未就绪
-
-检查 PostgreSQL 状态并执行迁移：
-
-```bash
-docker compose ps postgres
-docker compose exec api alembic upgrade head
-```
-
-### MinIO 未就绪
-
-```bash
-docker compose logs minio minio-init
-```
-
-确认 `.env` 中的 `MINIO_ACCESS_KEY`、`MINIO_SECRET_KEY` 和 `MINIO_BUCKET`
-没有在启动后被修改。修改已有实例凭据后可能需要重新创建本地开发容器。
-
-### 端口冲突
-
-检查本机的 `5173`、`5432`、`6379`、`8000`、`9000` 和 `9001` 端口，
-或修改 `docker-compose.yml` 左侧的宿主机端口。
-
-### Worker 无法连接 Redis
-
-容器内必须使用主机名 `redis`，不能使用 `localhost`。运行：
-
-```bash
-docker compose logs --tail=100 worker redis
-```
+本项目当前仓库未声明独立 License 文件；如需公开分发或商业使用，请先补充明确的许可证声明。
