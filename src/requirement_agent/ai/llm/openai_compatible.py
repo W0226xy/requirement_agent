@@ -1,9 +1,11 @@
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
+import json
+from time import perf_counter
 
 import httpx
 
-from requirement_agent.ai.llm.base import SchemaT, ToolCall, ToolChatResponse
+from requirement_agent.ai.llm.base import ChatStreamChunk, SchemaT, ToolCall, ToolChatResponse
 from requirement_agent.shared.errors import (
     LLMEmptyContentError,
     LLMOutputBudgetExceededError,
@@ -219,6 +221,80 @@ class OpenAICompatibleChatModel(_OpenAICompatibleClient):
             raise LLMServiceError(
                 "tool chat response has an invalid OpenAI-compatible shape"
             ) from None
+
+    async def stream_with_tools(
+        self, messages: list[dict[str, object]], *, tools: list[dict[str, object]]
+    ) -> AsyncIterator[ChatStreamChunk]:
+        """Parse OpenAI SSE without exposing partial tool JSON to callers."""
+        payload: dict[str, object] = {
+            "model": self._model, "messages": messages, "temperature": 0,
+            "max_tokens": self._max_tokens, "stream": True,
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+        headers = {"Authorization": f"Bearer {self._api_key}", "Accept": "text/event-stream"}
+        calls: dict[int, dict[str, str]] = {}
+        started = perf_counter()
+        text_chunks = 0
+        first_text_ms: int | None = None
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout_seconds, transport=self._transport) as client:
+                async with client.stream("POST", f"{self._base_url}/chat/completions", headers=headers, json=payload) as response:
+                    response.raise_for_status()
+                    logger.info("model_stream_started model=%s content_type=%s tools_enabled=%s",
+                                self._model, response.headers.get("content-type", ""), bool(tools))
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            return
+                        try:
+                            chunk = json.loads(data)
+                            choices = chunk.get("choices")
+                            # Some compatible providers send a final usage/metadata
+                            # frame after finish_reason with an empty choices array.
+                            if choices == []:
+                                continue
+                            if not isinstance(choices, list):
+                                raise TypeError("choices must be a list")
+                            choice = choices[0]
+                            delta = choice.get("delta", {})
+                        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+                            raise LLMServiceError("stream response has an invalid OpenAI-compatible shape") from exc
+                        content = delta.get("content")
+                        if isinstance(content, str) and content:
+                            text_chunks += 1
+                            if first_text_ms is None:
+                                first_text_ms = round((perf_counter() - started) * 1000)
+                                logger.info("model_stream_first_text model=%s elapsed_ms=%d length=%d",
+                                            self._model, first_text_ms, len(content))
+                            yield ChatStreamChunk(content=content)
+                        raw_calls = delta.get("tool_calls", [])
+                        if isinstance(raw_calls, list):
+                            for item in raw_calls:
+                                if not isinstance(item, Mapping):
+                                    continue
+                                index = item.get("index", 0)
+                                if not isinstance(index, int):
+                                    continue
+                                saved = calls.setdefault(index, {"id": f"call_{index}", "name": "", "arguments": ""})
+                                if isinstance(item.get("id"), str): saved["id"] = item["id"]
+                                function = item.get("function")
+                                if isinstance(function, Mapping):
+                                    if isinstance(function.get("name"), str): saved["name"] += function["name"]
+                                    if isinstance(function.get("arguments"), str): saved["arguments"] += function["arguments"]
+                        finish = choice.get("finish_reason")
+                        if isinstance(finish, str):
+                            complete_calls = [ToolCall(**call) for _, call in sorted(calls.items()) if call["name"]]
+                            yield ChatStreamChunk(tool_calls=complete_calls, finish_reason=finish)
+                            logger.info("model_stream_finished model=%s elapsed_ms=%d text_chunks=%d first_text_ms=%s finish_reason=%s",
+                                        self._model, round((perf_counter() - started) * 1000), text_chunks,
+                                        first_text_ms, finish)
+        except httpx.HTTPError as exc:
+            logger.warning("model_stream_failed model=%s error_type=%s", self._model, type(exc).__name__)
+            raise LLMServiceError(f"model stream request failed: {type(exc).__name__}") from None
 
     async def complete_structured(
         self,

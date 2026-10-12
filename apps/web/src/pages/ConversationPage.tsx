@@ -34,7 +34,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 
-import { api } from "../api";
+import { api, readSse } from "../api";
 import { EmptyBlock, ErrorBlock, StatusTag, formatDate } from "../components";
 import { useSession } from "../session";
 import type {
@@ -124,6 +124,7 @@ export function ConversationPage() {
   const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
   const [renameTitle, setRenameTitle] = useState("");
   const [renaming, setRenaming] = useState(false);
+  const [sseActive, setSseActive] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const conversationStreamRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -133,6 +134,8 @@ export function ConversationPage() {
   const bootstrapRunning = useRef(false);
   const creatingRef = useRef(false);
   const scrollMode = useRef<"initial" | "send" | null>(null);
+  const streamAbortRef = useRef<AbortController | null>(null);
+  const streamedEventIds = useRef(new Set<string>());
   activeKeyRef.current = conversationKey;
 
   const activeConversation = useMemo(
@@ -334,7 +337,61 @@ export function ConversationPage() {
   }, [conversationKey, loadConversationList, loadMessages]);
 
   useEffect(() => {
-    if (!conversationKey || !hasActiveTurn) return;
+    return () => {
+      streamAbortRef.current?.abort();
+      setSseActive(false);
+    };
+  }, [conversationKey]);
+
+  const subscribeMessage = useCallback((key: string, messageKey: string) => {
+    streamAbortRef.current?.abort();
+    const controller = new AbortController();
+    streamAbortRef.current = controller;
+    setSseActive(true);
+    streamedEventIds.current.clear();
+    const endpoint = `/api/v1/conversations/${encodeURIComponent(key)}/messages/${encodeURIComponent(messageKey)}/events`;
+    void readSse(endpoint, session, controller.signal, (event) => {
+      if (activeKeyRef.current !== key || controller.signal.aborted) return;
+      if (event.id && streamedEventIds.current.has(event.id)) return;
+      if (event.id) streamedEventIds.current.add(event.id);
+      const text = typeof event.data.text === "string" ? event.data.text : "";
+      if (import.meta.env.DEV && event.event === "delta") {
+        console.debug("conversation_sse_delta", { messageKey, eventId: event.id, length: text.length, at: performance.now() });
+      }
+      setMessages((current) => current.map((item) => {
+        if (item.message_key !== messageKey) return item;
+        if (event.event === "delta") return { ...item, content: item.content.startsWith("正在") ? text : item.content + text, chat_status: "processing" };
+        if (event.event === "status" && item.source && typeof event.data.stage === "string") {
+          const stage = event.data.stage;
+          const status = stage === "extracting" ? "parsing" : stage;
+          return { ...item, source: { ...item.source, processing_status: status as SourceRecord["processing_status"] } };
+        }
+        if (event.event === "tool_end" && typeof event.data.tool_name === "string") {
+          const summary = typeof event.data.summary === "string" ? event.data.summary : "查询完成";
+          return { ...item, tool_calls: [...item.tool_calls, { tool_name: event.data.tool_name, ok: summary !== "查询失败", summary }] };
+        }
+        if (event.event === "references" && Array.isArray(event.data.references)) return { ...item, references: event.data.references as ConversationMessage["references"] };
+        if (event.event === "done") return { ...item, content: typeof event.data.content === "string" ? event.data.content : item.content, chat_status: "completed" };
+        if (event.event === "error") return { ...item, content: typeof event.data.message === "string" ? event.data.message : "处理失败，请重试", chat_status: "failed" };
+        return item;
+      }));
+      if (event.event === "done" || event.event === "error") {
+        controller.abort();
+        setSseActive(false);
+        void loadMessages(key, false, false, "sse-final");
+        void loadConversationList(false, false);
+      }
+    }).catch((caught) => {
+      if (!controller.signal.aborted) {
+        // Existing polling remains the availability fallback when SSE/proxy fails.
+        console.warn("conversation_sse_unavailable", caught);
+        setSseActive(false);
+      }
+    });
+  }, [loadConversationList, loadMessages, session]);
+
+  useEffect(() => {
+    if (!conversationKey || !hasActiveTurn || sseActive) return;
     const timer = window.setInterval(() => {
       void loadMessages(conversationKey, false, true, "polling");
       void loadConversationList();
@@ -343,6 +400,7 @@ export function ConversationPage() {
   }, [
     conversationKey,
     hasActiveTurn,
+    sseActive,
     loadConversationList,
     loadMessages,
   ]);
@@ -450,15 +508,13 @@ export function ConversationPage() {
         });
         return next;
       });
+      subscribeMessage(conversationKey, result.assistant_message?.message_key ?? result.message.message_key);
       void message.success(
         ["traceability_query", "reporting_query", "general_query", "clarification"].includes(result.intent)
           ? (result.intent === "reporting_query" ? "需求报告正在生成" : "查询回答已加入会话")
           : result.replayed ? "该消息已提交，正在同步分析状态" : "需求已保存，AI 正在分析",
       );
-      await Promise.all([
-        loadMessages(conversationKey, false, true, "send-refetch"),
-        loadConversationList(),
-      ]);
+      await loadConversationList();
     } catch (caught) {
       setError(caught);
       setMessages((current) => current.map((item) =>

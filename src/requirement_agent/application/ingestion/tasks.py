@@ -28,6 +28,7 @@ from requirement_agent.connectors.feishu import (
 )
 from requirement_agent.infrastructure.database.models import (
     AuditLog,
+    ConversationMessage,
     SourceAttachment,
     SourceRecord,
 )
@@ -36,6 +37,7 @@ from requirement_agent.infrastructure.storage.base import ObjectStorage
 from requirement_agent.infrastructure.storage.minio import get_object_storage
 from requirement_agent.parsers.registry import ParserRegistry, get_parser_registry
 from requirement_agent.shared.config import get_settings
+from requirement_agent.infrastructure.events import publish_event
 from requirement_agent.shared.enums import (
     AttachmentParseStatus,
     AuditActionType,
@@ -101,6 +103,7 @@ async def parse_source_attachments(
             return
         #如果有附件未解析，更新需求记录的 processing_status 为 PARSING（解析中），并写入审计日志。
         source.processing_status = ProcessingStatus.PARSING
+        await _publish_source_status(session, source_record_id, "parsing", "正在解析附件和正文")
         session.add(#写入一条审计日志
             AuditLog(
                 actor_id="system",#系统自动操作
@@ -263,6 +266,7 @@ def register_tasks(celery_app: Celery) -> None:#注册 Celery 任务
 async def analyze_source(source_record_id: int) -> None:
     settings = get_settings()#读取项目配置，通常来自 .env 或配置类。
     async with get_session_factory()() as session:#创建异步数据库会话
+        await _publish_source_status(session, source_record_id, "extracting", "正在提取结构化需求")
         workflow = RequirementAnalysisWorkflow(#创建需求分析 Agent 工作流，并注入三个核心依赖
             session,#异步数据库会话，用于读取原始需求、附件、历史分析结果等
             get_llm(),#聊天模型，用于需求提取和冲突/风险分析
@@ -277,6 +281,21 @@ async def analyze_source(source_record_id: int) -> None:
             retrieval_min_similarity_score=settings.retrieval_min_similarity_score,
         )
         await workflow.run(source_record_id)#运行工作流，分析指定的原始需求记录 ID。工作流内部会调用 LLM、检索数据库、生成结构化结果，并写入数据库。
+        await _publish_source_status(session, source_record_id, "completed", "需求分析完成，等待审核", done=True)
+
+
+async def _publish_source_status(
+    session: AsyncSession, source_record_id: int, stage: str, message: str, *, done: bool = False
+) -> None:
+    chat_message = await session.scalar(
+        select(ConversationMessage).where(ConversationMessage.source_record_id == source_record_id)
+    )
+    if chat_message is None:
+        return
+    execution_id = f"source-{source_record_id}"
+    await publish_event(chat_message.message_key, "status", {"stage": stage, "message": message}, execution_id=execution_id)
+    if done:
+        await publish_event(chat_message.message_key, "done", {"status": "completed"}, execution_id=execution_id)
 
 
 #把一条已经审核通过的正式需求版本加入长期 RAG 知识库

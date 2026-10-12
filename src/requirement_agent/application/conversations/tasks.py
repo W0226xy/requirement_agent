@@ -1,5 +1,6 @@
 """Celery task registration for asynchronous conversation-memory compaction."""
 import logging
+from time import perf_counter
 
 from celery import Celery
 from sqlalchemy import select, update
@@ -23,6 +24,7 @@ from requirement_agent.application.ingestion.tasks import run_worker_coroutine
 from requirement_agent.infrastructure.database.models import RequirementConversation
 from requirement_agent.infrastructure.database.session import get_session_factory
 from requirement_agent.shared.config import get_settings
+from requirement_agent.infrastructure.events import publish_event
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +51,13 @@ async def process_chat_query(conversation_key: str, user_message_id: int, assist
         await session.commit()
         if claimed.rowcount != 1:
             return False
+        assistant = await session.get(ConversationMessage, assistant_message_id)
+        if assistant is None:
+            return False
+        execution_id = f"chat-{assistant_message_id}"
+        started = perf_counter()
+        delta_count = 0
+        await publish_event(assistant.message_key, "status", {"stage": "executing", "message": "正在生成回答"}, execution_id=execution_id)
         try:
             user_message = await session.get(ConversationMessage, user_message_id)
             if user_message is None or user_message.conversation_id is None:
@@ -57,13 +66,25 @@ async def process_chat_query(conversation_key: str, user_message_id: int, assist
             history = await _history_before(session, user_message)
             settings = get_settings()
             if intent == ConversationIntent.GENERAL_QUERY:
-                answer, tool_calls, references = await GeneralAssistantService(
+                service = GeneralAssistantService(
                     get_llm(), TavilyMCPClient(settings), conversation_key=conversation_key,
                     tool_timeout_seconds=settings.tavily_mcp_timeout_seconds,
-                ).answer(
+                )
+                emitted_delta = False
+                async def delta(text: str) -> None:
+                    nonlocal emitted_delta, delta_count
+                    emitted_delta = True
+                    delta_count += 1
+                    logger.info("chat_delta_publish execution_id=%s elapsed_ms=%d index=%d length=%d",
+                                execution_id, round((perf_counter() - started) * 1000), delta_count, len(text))
+                    await publish_event(assistant.message_key, "delta", {"text": text}, execution_id=execution_id)
+                async def tool(phase: str, name: str, summary: str) -> None:
+                    await publish_event(assistant.message_key, f"tool_{phase}", {"tool_name": name, "summary": summary}, execution_id=execution_id)
+                answer, tool_calls, references = await service.answer_stream(
                     user_message.content,
                     history=history,
                     requires_web_search=requires_web_search,
+                    on_delta=delta, on_tool=tool,
                 )
             else:
                 retriever = HybridRetriever(session, get_embedding_model(), RetrievalWeights(
@@ -71,13 +92,30 @@ async def process_chat_query(conversation_key: str, user_message_id: int, assist
                     business=settings.retrieval_business_weight), candidate_limit=settings.retrieval_candidate_limit,
                     min_similarity_score=settings.retrieval_min_similarity_score)
                 skill = get_skill("requirement_reporting") if intent == ConversationIntent.REPORTING_QUERY else get_skill()
+                emitted_delta = False
+                async def delta(text: str) -> None:
+                    nonlocal emitted_delta, delta_count
+                    emitted_delta = True
+                    delta_count += 1
+                    logger.info("chat_delta_publish execution_id=%s elapsed_ms=%d index=%d length=%d",
+                                execution_id, round((perf_counter() - started) * 1000), delta_count, len(text))
+                    await publish_event(assistant.message_key, "delta", {"text": text}, execution_id=execution_id)
+                async def tool(phase: str, name: str, summary: str) -> None:
+                    await publish_event(assistant.message_key, f"tool_{phase}", {"tool_name": name, "summary": summary}, execution_id=execution_id)
                 answer, tool_calls, references = await ChatAgentService(
                     session, get_llm(), ChatToolService(session, retriever, actor_id), actor_id, conversation_key, skill
-                ).answer(user_message.content, history=history)
+                ).answer_stream(user_message.content, history=history, on_delta=delta, on_tool=tool)
+            if not emitted_delta:
+                logger.info("chat_stream_degraded_to_complete conversation_key=%s", conversation_key)
+                await publish_event(assistant.message_key, "delta", {"text": answer}, execution_id=execution_id)
             await session.execute(update(ConversationMessage).where(ConversationMessage.id == assistant_message_id).values(
                 chat_status="completed", content=answer, tool_calls=tool_calls, references=references
             ))
             await session.commit()
+            logger.info("chat_query_persisted execution_id=%s elapsed_ms=%d delta_count=%d",
+                        execution_id, round((perf_counter() - started) * 1000), delta_count)
+            await publish_event(assistant.message_key, "references", {"references": references}, execution_id=execution_id)
+            await publish_event(assistant.message_key, "done", {"status": "completed"}, execution_id=execution_id)
             return True
         except Exception:
             logger.exception("chat query failed conversation_key=%s assistant_message_id=%s", conversation_key, assistant_message_id)
@@ -85,6 +123,7 @@ async def process_chat_query(conversation_key: str, user_message_id: int, assist
                 chat_status="failed", content="查询处理失败，请重试"
             ))
             await session.commit()
+            await publish_event(assistant.message_key, "error", {"code": "chat_failed", "message": "查询处理失败，请重试"}, execution_id=execution_id)
             return False
 
 

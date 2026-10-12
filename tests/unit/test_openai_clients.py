@@ -117,6 +117,34 @@ async def test_chat_parses_openai_tool_calls_and_sends_tool_definitions() -> Non
     assert json.loads(requests[0].content)["tools"][0]["function"]["name"] == "search_requirements"
 
 
+async def test_stream_emits_text_chunks_before_finish_and_disables_tools_for_final_turn() -> None:
+    requests: list[httpx.Request] = []
+    payload = (
+        'data: {"choices":[{"delta":{"content":"第一"},"finish_reason":null}]}\n\n'
+        'data: {"choices":[{"delta":{"content":"段"},"finish_reason":null}]}\n\n'
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        'data: [DONE]\n\n'
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=payload)
+
+    chat = OpenAICompatibleChatModel(
+        base_url="https://chat.example/v1", api_key="secret", model="chat-model",
+        timeout_seconds=10, max_tokens=512, transport=httpx.MockTransport(handler),
+    )
+    chunks = [chunk async for chunk in chat.stream_with_tools(
+        [{"role": "user", "content": "回答"}], tools=[]
+    )]
+    assert [chunk.content for chunk in chunks if chunk.content] == ["第一", "段"]
+    assert chunks[-1].finish_reason == "stop"
+    request_payload = json.loads(requests[0].content)
+    assert request_payload["stream"] is True
+    assert "tools" not in request_payload
+    assert "tool_choice" not in request_payload
+
+
 async def test_chat_uses_json_schema_for_pydantic_structured_output() -> None:
     class Classification(BaseModel):
         intent: str

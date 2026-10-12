@@ -1,9 +1,9 @@
 from typing import Any
 
-from requirement_agent.ai.llm.base import ToolCall, ToolChatResponse
+from requirement_agent.ai.llm.base import ChatStreamChunk, ToolCall, ToolChatResponse
 from requirement_agent.ai.skills import get_skill
 from requirement_agent.ai.tools.schemas import SearchRequirementsOutput
-from requirement_agent.application.chat_agent import ChatAgentService
+from requirement_agent.application.chat_agent import ChatAgentService, _official_result_urls
 
 
 class DummySession:
@@ -35,6 +35,21 @@ class FakeChat:
         return "普通文本降级回答"
 
 
+class StreamingChat(FakeChat):
+    def __init__(self, responses: list[ToolChatResponse], chunks: list[str]) -> None:
+        super().__init__(responses)
+        self.chunks = chunks
+        self.timeline: list[str] = []
+
+    async def stream_with_tools(self, messages: list[dict[str, object]], *, tools: list[dict[str, object]]):
+        assert tools == []  # Final user-visible turn must not re-enter the tool loop.
+        for index, chunk in enumerate(self.chunks):
+            self.timeline.append(f"model-{index}")
+            yield ChatStreamChunk(content=chunk)
+        self.timeline.append("model-finished")
+        yield ChatStreamChunk(finish_reason="stop")
+
+
 class FakeTools:
     async def search_requirements(self, value: Any) -> SearchRequirementsOutput:
         return SearchRequirementsOutput(items=[])
@@ -48,6 +63,33 @@ class FailingTools:
         raise RuntimeError("database unavailable")
 
 
+class VerifiedWebTools:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    async def tavily_search(self, value: Any) -> dict[str, object]:
+        self.calls.append(("tavily_search", value.model_dump()))
+        return {
+            "results": [
+                {"url": "https://docs.example.test/release"},
+                {"url": "https://github.com/example/project/releases"},
+                {"url": "https://pypi.org/project/example"},
+            ]
+        }
+
+    async def tavily_extract(self, value: Any) -> dict[str, object]:
+        self.calls.append(("tavily_extract", value.model_dump()))
+        return {
+            "results": [
+                {
+                    "title": "Example release",
+                    "url": "https://github.com/example/project/releases",
+                    "raw_content": "example==2.0.0",
+                }
+            ]
+        }
+
+
 def _agent(chat: FakeChat) -> ChatAgentService:
     return ChatAgentService(DummySession(), chat, FakeTools(), "user-1", "CONV-1")  # type: ignore[arg-type]
 
@@ -55,6 +97,48 @@ def _agent(chat: FakeChat) -> ChatAgentService:
 async def test_agent_returns_direct_model_answer_without_tool() -> None:
     answer, tools, references = await _agent(FakeChat([ToolChatResponse(content="直接回答")])).answer("你好")
     assert (answer, tools, references) == ("直接回答", [], [])
+
+
+async def test_streamed_final_answer_reaches_downstream_before_model_finishes() -> None:
+    chat = StreamingChat([ToolChatResponse(content="规划阶段不应显示")], ["第一段", "第二段"])
+    observed: list[str] = []
+
+    async def on_delta(value: str) -> None:
+        observed.append(value)
+        chat.timeline.append(f"downstream-{value}")
+
+    async def on_tool(_: str, __: str, ___: str) -> None:
+        raise AssertionError("this request has no tool call")
+
+    answer, _, _ = await _agent(chat).answer_stream("解释 RAG", on_delta=on_delta, on_tool=on_tool)
+    assert answer == "第一段第二段"
+    assert observed == ["第一段", "第二段"]
+    assert chat.timeline.index("downstream-第一段") < chat.timeline.index("model-finished")
+    assert "规划阶段不应显示" not in "".join(observed)
+
+
+async def test_tool_planning_is_hidden_but_final_answer_streams() -> None:
+    chat = StreamingChat(
+        [
+            ToolChatResponse(tool_calls=[ToolCall(id="1", name="search_requirements", arguments='{"query":"RAG"}')]),
+            ToolChatResponse(content="无需额外工具"),
+        ],
+        ["检索后", "回答"],
+    )
+    deltas: list[str] = []
+    tools: list[tuple[str, str]] = []
+
+    async def on_delta(value: str) -> None:
+        deltas.append(value)
+
+    async def on_tool(phase: str, name: str, _: str) -> None:
+        tools.append((phase, name))
+
+    answer, summaries, _ = await _agent(chat).answer_stream("查 RAG", on_delta=on_delta, on_tool=on_tool)
+    assert answer == "检索后回答"
+    assert deltas == ["检索后", "回答"]
+    assert tools == [("start", "search_requirements"), ("end", "search_requirements")]
+    assert summaries[0]["tool_name"] == "search_requirements"
 
 
 async def test_agent_executes_a_valid_tool_then_generates_answer() -> None:
@@ -117,6 +201,53 @@ async def test_agent_stops_after_three_tool_rounds() -> None:
     answer, calls, _ = await _agent(chat).answer("a")
     assert "最大工具调用次数" in answer
     assert len(calls) == 3
+
+
+async def test_verified_web_fact_forces_extract_after_search() -> None:
+    chat = FakeChat([
+        ToolChatResponse(tool_calls=[ToolCall(
+            id="search-1", name="tavily_search", arguments='{"query":"example latest version"}'
+        )]),
+        ToolChatResponse(content="根据官方正文，版本为 2.0.0。"),
+    ])
+    tools = VerifiedWebTools()
+    agent = ChatAgentService(
+        DummySession(), chat, tools, "user-1", "CONV-1", get_skill("general_assistant")
+    )  # type: ignore[arg-type]
+
+    answer, calls, _ = await agent.answer(
+        "example 当前最新版本是多少？", force_tavily_extract_after_search=True
+    )
+
+    assert answer == "根据官方正文，版本为 2.0.0。"
+    assert [call["tool_name"] for call in calls] == ["tavily_search", "tavily_extract"]
+    assert [name for name, _ in tools.calls] == ["tavily_search", "tavily_extract"]
+    assert tools.calls[1][1]["urls"] == [
+        "https://pypi.org/project/example",
+        "https://github.com/example/project/releases",
+        "https://docs.example.test/release",
+    ]
+    assert chat.messages[1][-2]["tool_calls"][0]["function"]["name"] == "tavily_extract"
+
+
+def test_verified_web_urls_prioritize_registries_releases_and_docs() -> None:
+    assert _official_result_urls({"results": [
+        {"url": "https://example.test/release"},
+        {"url": "https://docs.example.test/versions"},
+        {"url": "https://github.com/example/project/releases"},
+        {"url": "https://pypi.org/project/example"},
+    ]}) == [
+        "https://pypi.org/project/example",
+        "https://github.com/example/project/releases",
+        "https://docs.example.test/versions",
+    ]
+
+
+def test_verified_web_urls_reject_unverifiable_sites() -> None:
+    assert _official_result_urls({"results": [
+        {"url": "https://example.test/version"},
+        {"url": "https://medium.example.test/version"},
+    ]}) == []
 
 
 async def test_agent_degrades_when_provider_has_no_tool_support() -> None:

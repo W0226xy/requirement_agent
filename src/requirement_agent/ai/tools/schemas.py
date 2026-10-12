@@ -94,18 +94,18 @@ class GetRequirementReportSnapshotInput(ToolModel):
 
 
 class TavilySearchInput(ToolModel):
-    query: str = Field(min_length=1, max_length=1_000)
-    max_results: Annotated[int, Field(default=5, ge=1, le=10)] = 5
-    topic: Literal["general"] = "general"
-    search_depth: Literal["basic", "advanced", "fast", "ultra-fast"] = "basic"
-    time_range: Literal["day", "week", "month", "year"] | None = None
-    include_domains: list[str] = Field(default_factory=list, max_length=20)
-    exclude_domains: list[str] = Field(default_factory=list, max_length=20)
+    query: str = Field(min_length=1, max_length=1_000)#搜索文本
+    max_results: Annotated[int, Field(default=5, ge=1, le=10)] = 5#最大返回结果数
+    topic: Literal["general"] = "general"#搜索主题
+    search_depth: Literal["basic", "advanced", "fast", "ultra-fast"] = "basic"#搜索深度
+    time_range: Literal["day", "week", "month", "year"] | None = None#时间范围
+    include_domains: list[str] = Field(default_factory=list, max_length=20)#包含的域名
+    exclude_domains: list[str] = Field(default_factory=list, max_length=20)#排除的域名
 
 
 class TavilyExtractInput(ToolModel):
-    urls: list[str] = Field(min_length=1, max_length=5)
-    extract_depth: Literal["basic", "advanced"] = "basic"
+    urls: list[str] = Field(min_length=1, max_length=5)#要提取的网页 URL 列表
+    extract_depth: Literal["basic", "advanced"] = "basic"#提取深度
 
 
 class RequirementReportSnapshotOutput(ToolModel):

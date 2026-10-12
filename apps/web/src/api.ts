@@ -1,5 +1,41 @@
 import type { UserSession } from "./types";
 
+export type SseEvent = { id?: string; event: string; data: Record<string, unknown> };
+
+export async function readSse(
+  path: string, session: UserSession, signal: AbortSignal,
+  onEvent: (event: SseEvent) => void,
+) {
+  const response = await fetch(path, { signal, headers: {
+    Accept: "text/event-stream", "X-Actor-ID": session.actorId, "X-Actor-Role": session.role,
+  }});
+  if (!response.ok || !response.body) throw new ApiError("实时连接失败", response.status);
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let pending: Partial<SseEvent> = {};
+  const flush = () => {
+    if (pending.event && pending.data) onEvent(pending as SseEvent);
+    pending = {};
+  };
+  while (true) {
+    const { done, value } = await reader.read();
+    buffer += decoder.decode(value, { stream: !done });
+    let newline: number;
+    while ((newline = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, newline).replace(/\r$/, ""); buffer = buffer.slice(newline + 1);
+      if (!line) { flush(); continue; }
+      const separator = line.indexOf(":");
+      const field = separator < 0 ? line : line.slice(0, separator);
+      const valueText = separator < 0 ? "" : line.slice(separator + 1).replace(/^ /, "");
+      if (field === "id") pending.id = valueText;
+      if (field === "event") pending.event = valueText;
+      if (field === "data") { try { pending.data = JSON.parse(valueText) as Record<string, unknown>; } catch { /* wait for valid event */ } }
+    }
+    if (done) break;
+  }
+}
+
 type ApiErrorBody = {
   error?: { code?: string; message?: string };
   detail?: string | { msg?: string }[];

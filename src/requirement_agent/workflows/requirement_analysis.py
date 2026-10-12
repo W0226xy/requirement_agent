@@ -76,6 +76,7 @@ from requirement_agent.infrastructure.database.models import (
     SourceRecord,
 )
 from requirement_agent.shared.config import get_settings
+from requirement_agent.infrastructure.events import publish_event
 from requirement_agent.shared.enums import (
     AnalysisType,
     AuditActionType,
@@ -800,6 +801,19 @@ class RequirementAnalysisWorkflow:
             raise SourceNotFoundError(f"source record {source_record_id} was not found")
         source.processing_status = status
         await self._session.commit()#提交事务，将状态更新保存到数据库。
+        stages = {
+            ProcessingStatus.EXTRACTED: ("extracted", "已完成结构化需求提取"),
+            ProcessingStatus.RETRIEVING: ("retrieving", "正在检索相关历史需求"),
+            ProcessingStatus.ANALYZING: ("analyzing", "正在分析关联、冲突和风险"),
+            ProcessingStatus.PENDING_REVIEW: ("pending_review", "分析完成，等待审核"),
+        }
+        if status in stages:
+            message = await self._session.scalar(
+                select(ConversationMessage).where(ConversationMessage.source_record_id == source_record_id)
+            )
+            if message is not None:
+                stage, description = stages[status]
+                await publish_event(message.message_key, "status", {"stage": stage, "message": description}, execution_id=f"source-{source_record_id}")
 
     @staticmethod
     def _source_content(source: SourceRecord) -> str:

@@ -1,3 +1,4 @@
+from collections.abc import AsyncIterator
 from typing import Protocol, TypeVar
 
 from pydantic import BaseModel
@@ -17,6 +18,13 @@ class ToolChatResponse(BaseModel):
     tool_calls: list[ToolCall] = []
 
 
+class ChatStreamChunk(BaseModel):
+    """A provider-neutral visible-text/tool-call stream fragment."""
+    content: str = ""
+    tool_calls: list[ToolCall] = []
+    finish_reason: str | None = None
+
+
 class ChatModel(Protocol):
     @property
     def model_name(self) -> str:
@@ -33,6 +41,11 @@ class ChatModel(Protocol):
     async def complete_with_tools(
         self, messages: list[dict[str, object]], *, tools: list[dict[str, object]]
     ) -> ToolChatResponse:
+        ...
+
+    def stream_with_tools(
+        self, messages: list[dict[str, object]], *, tools: list[dict[str, object]]
+    ) -> AsyncIterator[ChatStreamChunk]:
         ...
 
     async def complete_structured(

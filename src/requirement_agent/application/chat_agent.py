@@ -2,7 +2,7 @@
 import asyncio
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from time import perf_counter
 
 from pydantic import ValidationError
@@ -37,6 +37,7 @@ class ChatAgentService:
         *,
         history: list[dict[str, str]] | None = None,
         additional_system_instruction: str = "",
+        force_tavily_extract_after_search: bool = False,
     ) -> tuple[str, list[dict[str, object]], list[dict[str, object]]]:
         messages: list[dict[str, object]] = [
             #一开始构造两条消息system_prompt、output_constraints和当前会话的 conversation_key，作为系统消息；
@@ -78,6 +79,33 @@ class ChatAgentService:
                     #把工具调用结果作为工具消息，继续下一轮对话
                     messages.append({"role": "tool", "tool_call_id": call.id, "name": call.name,
                         "content": result.model_dump_json()})
+                    if (
+                        force_tavily_extract_after_search
+                        and call.name == "tavily_search"
+                        and result.ok
+                        and not any(item.name == "tavily_extract" for item in response.tool_calls)
+                    ):
+                        extract_result = await self._force_tavily_extract(messages, result)
+                        if extract_result is None:
+                            return (
+                                "暂时无法确认：搜索结果中没有可验证的官方页面。",
+                                summaries,
+                                _references(summaries),
+                            )
+                        summaries.append(
+                            {
+                                "tool_name": "tavily_extract",
+                                "ok": extract_result.ok,
+                                "summary": _result_summary(extract_result),
+                                "references": _result_references(extract_result),
+                            }
+                        )
+                        if not extract_result.ok:
+                            return (
+                                "暂时无法确认：无法读取官方页面以验证该实时事实。",
+                                summaries,
+                                _references(summaries),
+                            )
             return "已达到本次查询的最大工具调用次数，请缩小问题范围后重试。", summaries, _references(summaries)
         except (LLMServiceError, NotImplementedError) as exc:
             logger.info("chat_tool_call_unavailable conversation=%s error_type=%s", self._conversation_key, type(exc).__name__)
@@ -88,6 +116,70 @@ class ChatAgentService:
             return await self._chat_model.complete(
                 fallback_messages, analysis_type="conversation_summary"
             ), summaries, _references(summaries)
+
+    async def answer_stream(
+        self, user_message: str, *, history: list[dict[str, str]] | None = None,
+        on_delta: Callable[[str], Awaitable[None]],
+        on_tool: Callable[[str, str, str], Awaitable[None]],
+        additional_system_instruction: str = "",
+    ) -> tuple[str, list[dict[str, object]], list[dict[str, object]]]:
+        """Tool loop with true provider streaming only for the final visible turn."""
+        if not hasattr(self._chat_model, "stream_with_tools"):
+            logger.info("chat_stream_degraded provider=%s", self._chat_model.model_name)
+            return await self.answer(user_message, history=history)
+        messages: list[dict[str, object]] = [{"role": "system", "content":
+            f"{self._skill.system_prompt}\n{self._skill.output_constraints}\n"
+            f"{additional_system_instruction}\n"
+            "当前阶段只决定是否调用工具；如无需工具，不要回答用户问题。\n"
+            f"当前会话 conversation_key：{self._conversation_key}"}]
+        messages.extend({"role": item["role"], "content": item["content"]} for item in history or [])
+        messages.append({"role": "user", "content": user_message})
+        summaries: list[dict[str, object]] = []
+        for _ in range(MAX_TOOL_ROUNDS):
+            # Planning is deliberately non-streaming: its text and JSON are never
+            # user-visible. Once evidence is ready, the separate final turn below
+            # streams immediately without exposing tools.
+            response = await self._chat_model.complete_with_tools(
+                messages, tools=openai_tools(self._skill.allowed_tools)
+            )
+            calls = response.tool_calls
+            if not calls:
+                return await self._stream_final_answer(messages, summaries, on_delta)
+            messages.append({"role": "assistant", "content": "", "tool_calls": [
+                {"id": call.id, "type": "function", "function": {"name": call.name, "arguments": call.arguments}}
+                for call in calls]})
+            for call in calls:
+                await on_tool("start", call.name, "正在查询相关资料")
+                result = await self._execute(call.name, call.arguments)
+                summary = _result_summary(result)
+                summaries.append({"tool_name": call.name, "ok": result.ok, "summary": summary,
+                                  "references": _result_references(result)})
+                await on_tool("end", call.name, summary)
+                messages.append({"role": "tool", "tool_call_id": call.id, "name": call.name,
+                                 "content": result.model_dump_json()})
+        return "已达到本次查询的最大工具调用次数，请缩小问题范围后重试。", summaries, _references(summaries)
+
+    async def _stream_final_answer(
+        self,
+        messages: list[dict[str, object]],
+        summaries: list[dict[str, object]],
+        on_delta: Callable[[str], Awaitable[None]],
+    ) -> tuple[str, list[dict[str, object]], list[dict[str, object]]]:
+        """Generate the only user-visible answer; emit each provider chunk now."""
+        final_messages = [*messages, {"role": "system", "content":
+            "现在基于已有上下文和工具结果直接回答用户。禁止调用任何工具。"}]
+        parts: list[str] = []
+        async for chunk in self._chat_model.stream_with_tools(final_messages, tools=[]):  # type: ignore[attr-defined]
+            if chunk.content:
+                parts.append(chunk.content)
+                await on_delta(chunk.content)
+            if chunk.tool_calls:
+                # A compliant provider cannot return tools when none were offered.
+                raise LLMServiceError("model attempted tools in final streaming turn")
+        answer = "".join(parts)
+        if not answer:
+            raise LLMServiceError("model stream ended without final content")
+        return answer, summaries, _references(summaries)
 
     #Function Call 最关键的保护部分。
     async def _execute(self, name: str, raw_arguments: str) -> ToolExecutionResult:
@@ -158,10 +250,70 @@ class ChatAgentService:
             await self._session.rollback()
             logger.exception("chat_tool_audit_failed tool=%s", name)
 
+    async def _force_tavily_extract(
+        self, messages: list[dict[str, object]], search_result: ToolExecutionResult
+    ) -> ToolExecutionResult | None:
+        urls = _official_result_urls(search_result.data or {})
+        if not urls:
+            return None
+        call_id = "forced_tavily_extract"
+        arguments = json.dumps({"urls": urls, "extract_depth": "basic"})
+        messages.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": "tavily_extract", "arguments": arguments},
+                    }
+                ],
+            }
+        )
+        result = await self._execute("tavily_extract", arguments)
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "name": "tavily_extract",
+                "content": result.model_dump_json(),
+            }
+        )
+        return result
+
 
 def _redact(value: dict[str, object]) -> dict[str, object]:
     return {key: (f"{str(item)[:80]}…" if key == "query" and len(str(item)) > 80 else item)
             for key, item in value.items()}
+
+
+def _official_result_urls(data: Mapping[str, object]) -> list[str]:
+    """Prefer package registries, release pages, then official documentation."""
+    results = data.get("results")
+    if not isinstance(results, list):
+        return []
+    candidates = [
+        item["url"]
+        for item in results
+        if isinstance(item, Mapping)
+        and isinstance(item.get("url"), str)
+        and _official_url_priority(item["url"])[0] < 4
+    ]
+    return sorted(dict.fromkeys(candidates), key=_official_url_priority)[:3]
+
+
+def _official_url_priority(url: str) -> tuple[int, str]:
+    lowered = url.lower()
+    if "pypi.org/" in lowered or "npmjs.com/" in lowered:
+        return 0, lowered
+    if "github.com/" in lowered and "/releases" in lowered:
+        return 1, lowered
+    if "docs." in lowered or "/docs/" in lowered:
+        return 2, lowered
+    if "langchain.com/" in lowered:
+        return 3, lowered
+    return 4, lowered
 
 
 def _result_summary(result: ToolExecutionResult) -> str:

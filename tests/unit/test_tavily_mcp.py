@@ -24,6 +24,14 @@ def test_mcp_result_normalization_preserves_source_url() -> None:
     }]
 
 
+def test_mcp_result_normalization_preserves_published_date_when_available() -> None:
+    result = _normalize_result([{
+        "text": '{"results": [{"title": "Tavily", "url": "https://example.test/a", '
+        '"published_date": "2026-09-30", "content": "ok"}]}'
+    }])
+    assert result["results"][0]["published_date"] == "2026-09-30"
+
+
 def test_search_input_matches_remote_mcp_general_topic_schema() -> None:
     value = TavilySearchInput(
         query="latest AI news", time_range="day", include_domains=["example.com"]

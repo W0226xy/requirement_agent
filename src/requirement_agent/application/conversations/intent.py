@@ -8,23 +8,24 @@ from requirement_agent.shared.errors import LLMServiceError
 
 
 class ConversationIntent(StrEnum):
-    REQUIREMENT_SUBMISSION = "requirement_submission"
-    TRACEABILITY_QUERY = "traceability_query"
-    REPORTING_QUERY = "reporting_query"
-    CLARIFICATION = "clarification"
-    GENERAL_QUERY = "general_query"
+    REQUIREMENT_SUBMISSION = "requirement_submission"#提交、修改、删除或恢复需求
+    TRACEABILITY_QUERY = "traceability_query"#查询历史需求、来源、版本
+    REPORTING_QUERY = "reporting_query"#需求汇总、统计、报告
+    CLARIFICATION = "clarification"#对上一轮需求澄清问题的补充
+    GENERAL_QUERY = "general_query"#与需求系统无关的普通问答
 
 
+#模型必须遵守的返回结构，这里使用 Pydantic 做结构化约束。
 class IntentClassification(BaseModel):
     """The classifier's constrained output; no natural-language label parsing."""
 
     model_config = ConfigDict(extra="forbid")
 
-    intent: ConversationIntent
-    confidence: float = Field(ge=0, le=1)
-    requires_web_search: bool
+    intent: ConversationIntent#最终路由类别，必须是前述五种之一
+    confidence: float = Field(ge=0, le=1)#模型对判断结果可信度
+    requires_web_search: bool#是否需要联网搜索。
 
-
+#没有 LLM 时的规则分类关键词
 _QUERY_MARKERS = ("有没有", "查询", "历史需求", "来源", "之前怎么改", "之前修改", "req-")
 _SUBMISSION_MARKERS = (
     "新增", "需要", "支持", "功能", "优化", "修改", "实现", "需求",
@@ -36,6 +37,7 @@ _WEB_MARKERS = (
 )
 _CLARIFICATION_MARKERS = ("是的", "不是", "补充", "刚才", "上一条", "前面说的")
 
+#分类任务的规则说明
 _CLASSIFIER_PROMPT = """你是需求管理系统的路由分类器。只根据当前消息和有限会话上下文分类，绝不调用检索或假设系统内数据。
 可选 intent：
 - requirement_submission：新增、修改、删除、恢复需求或带附件的需求输入。
@@ -55,25 +57,29 @@ class IntentClassifier:
 
     async def classify(
         self,
-        message: str,
+        message: str,#当前用户输入
         *,
-        recent_context: list[dict[str, str]],
-        has_attachment: bool,
+        recent_context: list[dict[str, str]],#最近六条会话上下文，包含 role 和 content
+        has_attachment: bool,#当前消息是否带附件
     ) -> IntentClassification:
-        if has_attachment:
+        if has_attachment:#带附件的消息不交给 LLM 判断，而是直接归为需求提交
+            #PDF、Word、图片等附件在你的系统中默认被认为是待分析的需求材料
             return IntentClassification(
                 intent=ConversationIntent.REQUIREMENT_SUBMISSION,
                 confidence=1,
                 requires_web_search=False,
             )
-        messages = [
+        messages = [#构建 LLM 消息
+            #系统消息，告诉模型它的角色和任务
             {"role": "system", "content": _CLASSIFIER_PROMPT},
+            #用户消息，包含当前消息和最近六条会话上下文
             {
                 "role": "user",
                 "content": _classification_input(message, recent_context),
             },
         ]
         try:
+            #调用 LLM 的 structured 输出接口，要求返回 IntentClassification 结构化对象
             result = await self._model.complete_structured(
                 messages, schema=IntentClassification, temperature=0.1
             )
@@ -82,7 +88,7 @@ class IntentClassifier:
                 update={
                     "requires_web_search": (
                         result.requires_web_search
-                        if result.intent == ConversationIntent.GENERAL_QUERY
+                        if result.intent == ConversationIntent.GENERAL_QUERY#只有与需求无关的普通问答才可能需要联网搜索
                         else False
                     )
                 }
@@ -92,7 +98,8 @@ class IntentClassifier:
                 message, has_attachment=has_attachment
             )
 
-
+#_classification_input() 会取最近六条会话，并把每条内容截断到 800 字符
+#作用是解决指代和补充问题，模型能结合上下文判断它是 CLARIFICATION，而不是一条新的需求
 def _classification_input(message: str, recent_context: list[dict[str, str]]) -> str:
     context = recent_context[-6:]
     rendered = "\n".join(
@@ -100,24 +107,24 @@ def _classification_input(message: str, recent_context: list[dict[str, str]]) ->
     )
     return f"最近会话上下文（可能为空）：\n{rendered or '（无）'}\n\n当前消息：\n{message}"
 
-
+#无 LLM 时的规则分类
 def fallback_classify_conversation_message(
     text: str, *, has_attachment: bool
 ) -> IntentClassification:
     """Conservative availability fallback when structured LLM classification fails."""
-    normalized = text.strip().lower()
-    if has_attachment:
+    normalized = text.strip().lower()#将文本标准化为小写，去除首尾空白
+    if has_attachment:#带附件的消息直接归为需求提交
         intent = ConversationIntent.REQUIREMENT_SUBMISSION
-    elif any(marker in normalized for marker in _REPORTING_MARKERS):
+    elif any(marker in normalized for marker in _REPORTING_MARKERS):#包含需求报告、总结、汇总等关键词的消息归为需求汇总查询
         intent = ConversationIntent.REPORTING_QUERY
-    elif any(marker in normalized for marker in _QUERY_MARKERS) and "需求" in normalized:
+    elif any(marker in normalized for marker in _QUERY_MARKERS) and "需求" in normalized:#包含查询、历史需求、来源等关键词且包含“需求”的消息归为需求追溯查询
         intent = ConversationIntent.TRACEABILITY_QUERY
-    elif any(marker in normalized for marker in _SUBMISSION_MARKERS):
+    elif any(marker in normalized for marker in _SUBMISSION_MARKERS):#包含提交、上传等关键词的消息归为需求提交
         intent = ConversationIntent.REQUIREMENT_SUBMISSION
-    elif any(marker in normalized for marker in _CLARIFICATION_MARKERS):
+    elif any(marker in normalized for marker in _CLARIFICATION_MARKERS):#包含澄清、确认等关键词的消息归为需求澄清
         intent = ConversationIntent.CLARIFICATION
     else:
-        intent = ConversationIntent.GENERAL_QUERY
+        intent = ConversationIntent.GENERAL_QUERY#不符合上述条件的消息归为普通问答
     return IntentClassification(
         intent=intent,
         confidence=0.35,

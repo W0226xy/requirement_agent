@@ -14,6 +14,8 @@ from fastapi import (
     UploadFile,
     status,
 )
+from fastapi.responses import StreamingResponse
+import json
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -61,6 +63,7 @@ from requirement_agent.infrastructure.database.session import get_session
 from requirement_agent.shared.config import get_settings
 from requirement_agent.shared.enums import AnalysisType, ProcessingStatus
 from requirement_agent.shared.errors import FileTooLargeError
+from requirement_agent.infrastructure.events import ConversationEventService
 
 router = APIRouter(prefix="/api/v1/conversations", tags=["conversations"])
 logger = logging.getLogger(__name__)
@@ -267,6 +270,85 @@ async def list_conversation_messages(
     )
 
 
+@router.get("/{conversation_key}/messages/{message_key}/events")
+async def stream_conversation_message_events(
+    conversation_key: str,
+    message_key: str,
+    actor_id: Annotated[str, Depends(get_actor_id)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+    ingestion_service: Annotated[IngestionService, Depends(get_ingestion_service)],
+    last_event_id: Annotated[str | None, Header(alias="Last-Event-ID")] = None,
+    cursor: Annotated[str | None, Query()] = None,
+) -> StreamingResponse:
+    """Authenticated Redis-Streams subscription; DB snapshots cover expired streams."""
+    message = await _service(session, ingestion_service).load_message(conversation_key, actor_id, message_key)
+    start = cursor or last_event_id or "0-0"
+
+    async def body():
+        events = ConversationEventService()
+        current = start
+        try:
+            # xread from the supplied id is atomic with the next blocking read,
+            # avoiding the replay/live hand-off gap.
+            while True:
+                try:
+                    rows = await events.read(message_key, current)
+                except Exception:
+                    yield _sse("error", None, {"message_key": message_key, "code": "event_unavailable", "message": "实时连接暂不可用，请继续等待状态刷新"})
+                    return
+                if not rows:
+                    yield ": heartbeat\n\n"
+                    # A completed record is authoritative even after stream expiry.
+                    await session.refresh(message)
+                    if message.chat_status in {"completed", "failed"}:
+                        event = "done" if message.chat_status == "completed" else "error"
+                        data: dict[str, object] = {"message_key": message_key, "snapshot": True, "status": message.chat_status}
+                        if event == "done":
+                            data.update({"content": message.content, "references": message.references})
+                        else:
+                            data.update({"code": "chat_failed", "message": message.content})
+                        yield _sse(event, None, data)
+                        return
+                    if message.source_record_id:
+                        source = await session.get(SourceRecord, message.source_record_id)
+                        if source and source.processing_status in {
+                            ProcessingStatus.PENDING_REVIEW, ProcessingStatus.VERSIONED,
+                            ProcessingStatus.REJECTED, ProcessingStatus.RETURNED,
+                        }:
+                            yield _sse("done", None, {"message_key": message_key, "snapshot": True, "status": "completed"})
+                            return
+                        if source and source.processing_status in {
+                            ProcessingStatus.PARSE_FAILED, ProcessingStatus.EXTRACTION_FAILED,
+                            ProcessingStatus.ANALYSIS_FAILED,
+                        }:
+                            yield _sse("error", None, {"message_key": message_key, "code": "source_failed", "message": "需求处理失败，请重新分析"})
+                            return
+                    continue
+                for event_id, event, data in rows:
+                    current = event_id
+                    if event == "delta":
+                        text = data.get("text")
+                        logger.info(
+                            "conversation_sse_sent message_key=%s event_id=%s length=%d",
+                            message_key, event_id, len(text) if isinstance(text, str) else 0,
+                        )
+                    yield _sse(event, event_id, data)
+                    if event in {"done", "error"}:
+                        return
+        finally:
+            await events.close()
+
+    return StreamingResponse(body(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no",
+        "Connection": "keep-alive",
+    })
+
+
+def _sse(event: str, event_id: str | None, data: dict[str, object]) -> str:
+    prefix = f"id: {event_id}\n" if event_id else ""
+    return f"{prefix}event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
 @router.post(
     "/{conversation_key}/messages",
     response_model=CreateConversationMessageResponse,
@@ -361,6 +443,17 @@ async def create_conversation_message(
     if result.replayed:
         response.status_code = status.HTTP_200_OK
     projected = await _project_messages(session, [loaded])
+    if loaded.source_record_id:
+        # Best effort: failure here never changes the accepted ingestion result.
+        event_service = ConversationEventService()
+        try:
+            await event_service.publish(
+                loaded.message_key, "status",
+                {"stage": "queued", "message": "需求已保存，等待后台处理"},
+                execution_id=f"source-{loaded.source_record_id}",
+            )
+        finally:
+            await event_service.close()
     return CreateConversationMessageResponse(
         message=projected[0],
         replayed=result.replayed,
