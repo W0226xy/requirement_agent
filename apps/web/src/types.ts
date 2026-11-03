@@ -60,11 +60,19 @@ export type ConversationMessage = {
   source: SourceRecord | null;
   content: string;
   tool_calls: { tool_name: string; ok: boolean; summary: string }[];
-  references: Record<string, unknown>[];
+  references: ConversationReference[];
   chat_status: string;
   latest_extraction: Record<string, unknown> | null;
   latest_conflict_analysis: Record<string, unknown> | null;
   review_task: ReviewTask | null;
+};
+
+export type ConversationReference = {
+  type?: string;
+  id?: string | number;
+  title?: string | null;
+  url?: string | null;
+  [key: string]: unknown;
 };
 
 export type CreateConversationMessageResponse = {
@@ -77,7 +85,7 @@ export type CreateConversationMessageResponse = {
 export type ChatQueryResponse = {
   answer: string;
   tool_calls: { tool_name: string; ok: boolean; summary: string }[];
-  references: Record<string, unknown>[];
+  references: ConversationReference[];
 };
 
 export type FeatureLineage = {

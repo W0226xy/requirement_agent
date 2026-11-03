@@ -40,6 +40,7 @@ import { useSession } from "../session";
 import type {
   Conversation,
   ConversationMessage,
+  ConversationReference,
   CreateConversationMessageResponse,
   PageResponse,
   ProposedOperation,
@@ -49,6 +50,7 @@ import type {
 } from "../types";
 import { applyReviewTaskUpdate } from "./conversationReviewUpdate";
 import { mergeServerMessages, upsertMessages } from "./conversationMessageState";
+import { ConversationReferences } from "./ConversationReferences";
 
 type Draft = {
   task: ReviewTask;
@@ -1210,7 +1212,7 @@ function ChatConversationTurn({
   onReference,
 }: {
   message: ConversationMessage;
-  onReference: (reference: Record<string, unknown>) => void;
+  onReference: (reference: ConversationReference) => void;
 }) {
   const assistant = message.role === "assistant";
   return (
@@ -1229,19 +1231,7 @@ function ChatConversationTurn({
             已调用：{message.tool_calls.map((item) => item.tool_name).join("、")}
           </Typography.Text>
         )}
-        {!!message.references.length && (
-          <Space wrap style={{ marginTop: 8 }}>
-            {message.references.map((reference) => (
-              <Button
-                key={`${String(reference.type)}-${String(reference.id)}`}
-                size="small"
-                onClick={() => onReference(reference)}
-              >
-                {reference.type === "source" ? "来源" : reference.type === "web" ? "网页" : "需求"}：{String(reference.title ?? reference.id)}
-              </Button>
-            ))}
-          </Space>
-        )}
+        <ConversationReferences references={message.references} onReference={onReference} />
         <div className="chat-meta">{formatDate(message.created_at)}</div>
       </div>
     </div>
